@@ -324,7 +324,7 @@ LANGS = {
         "referral_label": "Link de Indicação",
         "referral_desc": "Compartilhe seu link e ganhe comissão!",
         "history_title": "📜 <b>HISTÓRICO DE PEDIDOS</b>",
-        "no_orders": "📜 Você ainda não tem pedidos.",
+        "no_orders": "���� Você ainda não tem pedidos.",
         "wallet_title": "💰 <b>CARTEIRA</b>",
         "usdt_balance": "Saldo USDT",
         "deposit_btn": "➕ Depositar",
@@ -487,7 +487,7 @@ LANGS = {
         "invalid_qty": "अमान्य मात्रा। 1 और {max} के बीच संख्या दर्ज करें।",
         "insufficient_balance": "बैलेंस कम है! आपको ${needed:.2f} USDT चाहिए लेकिन है ${balance:.2f} USDT।\nपहले डिपॉजिट करें।",
         "waiting_payment": "⏳ <b>भुगतान का इंतजार...</b>",
-        "payment_expired": "भुगतान समय समाप्त। फिर कोशिश करें।",
+        "payment_expired": "भुगतान समय समाप्त। फिर कोशिश करे���।",
         "deposit_info_title": "💵 <b>USDT डिपॉजिट जानकारी</b>",
         "deposit_info_amount": "राशि",
         "deposit_info_code": "कोड",
@@ -560,13 +560,13 @@ LANGS = {
         "waiting_payment": "⏳ <b>รอการชำระเงิน...</b>",
         "payment_expired": "การชำระเงินหมดเวลา กรุณาลองใหม่",
         "deposit_info_title": "💵 <b>ข้อมูลฝาก USDT</b>",
-        "deposit_info_amount": "จำนวน",
+        "deposit_info_amount": "จ��นวน",
         "deposit_info_code": "รหัส",
         "option1_title": "🔶 ตัวเลือก 1: BINANCE PAY (ทันที, ฟรี)",
         "option1_binance_id": "Binance ID",
         "option1_amount": "จำนวน",
         "option1_note": "หมายเหตุ",
-        "option1_steps": "B. Binance → Pay → Send → วาง ID ด้านบน\n⚠️ หมายเหตุต้องถูกต้องทุกตัวอักษร!",
+        "option1_steps": "B. Binance → Pay → Send → วาง ID ด้านบน\n⚠️ หมายเหตุต้องถูกต้องทุกต��วอักษร!",
         "option2_title": "🔷 ตัวเลือก 2: โอนกระเป๋า (BEP20)",
         "option2_address": "ที่อยู่",
         "option2_network": "เครือข่าย: <b>BEP20</b>",
@@ -1467,8 +1467,15 @@ async def scanner_loop():
 async def main():
     init_db()
     print("SukoShop Bot running...")
+    # Clear any lingering webhook and drop old queued updates to avoid
+    # "terminated by other getUpdates request" conflicts on redeploy.
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        print(f"[startup] delete_webhook warning: {e}")
     asyncio.create_task(scanner_loop())
-    await dp.start_polling(bot)
+    # allow_updates reset + drop pending updates also helps recover from conflicts
+    await dp.start_polling(bot, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
