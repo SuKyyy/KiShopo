@@ -1,27 +1,157 @@
 import asyncio
+import sqlite3
+import os
+import random
+import string
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
-import os
-from datetime import datetime
 
 load_dotenv()
 bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher()
 
 ADMIN = "@sukodeuva"
+ADMIN_URL = "https://t.me/sukodeuva"
+BINANCE_ID = os.getenv("BINANCE_ID", "YOUR_BINANCE_ID")
+BEP20_ADDRESS = os.getenv("BEP20_ADDRESS", "YOUR_BEP20_WALLET_ADDRESS")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "SukoShopBot")
+DB_PATH = "sukoshop.db"
+
+# ================== DATABASE ==================
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            name TEXT,
+            balance REAL DEFAULT 0.0,
+            lang TEXT DEFAULT 'en',
+            referral TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            order_code TEXT,
+            product_name TEXT,
+            price REAL,
+            quantity INTEGER DEFAULT 1,
+            status TEXT DEFAULT 'Pending',
+            created_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pending_payments (
+            code TEXT PRIMARY KEY,
+            user_id INTEGER,
+            product_id TEXT,
+            quantity INTEGER,
+            amount REAL,
+            payment_type TEXT,
+            expires_at TEXT,
+            created_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_user(user_id: int, name: str = None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    if not row:
+        referral = f"https://t.me/{BOT_USERNAME}?start={user_id}"
+        c.execute("INSERT INTO users (user_id, name, balance, lang, referral) VALUES (?,?,?,?,?)",
+                  (user_id, name or "User", 0.0, "en", referral))
+        conn.commit()
+        c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+        row = c.fetchone()
+    elif name and row[1] != name:
+        c.execute("UPDATE users SET name=? WHERE user_id=?", (name, user_id))
+        conn.commit()
+    conn.close()
+    return {"user_id": row[0], "name": row[1], "balance": row[2], "lang": row[3], "referral": row[4]}
+
+def set_user_lang(user_id: int, lang: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET lang=? WHERE user_id=?", (lang, user_id))
+    conn.commit()
+    conn.close()
+
+def update_balance(user_id: int, delta: float):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (delta, user_id))
+    conn.commit()
+    conn.close()
+
+def add_order(user_id: int, order_code: str, product_name: str, price: float, quantity: int = 1, status: str = "Pending"):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO orders (user_id, order_code, product_name, price, quantity, status, created_at) VALUES (?,?,?,?,?,?,?)",
+              (user_id, order_code, product_name, price, quantity, status,
+               datetime.now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    conn.close()
+
+def get_orders(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT order_code, product_name, price, quantity, status, created_at FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 10", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def save_pending_payment(code: str, user_id: int, product_id: str, quantity: int, amount: float, payment_type: str, expires_at: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO pending_payments (code, user_id, product_id, quantity, amount, payment_type, expires_at, created_at) VALUES (?,?,?,?,?,?,?,?)",
+              (code, user_id, product_id, quantity, amount, payment_type, expires_at,
+               datetime.now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    conn.close()
+
+def get_pending_payment(code: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM pending_payments WHERE code=?", (code,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {"code": row[0], "user_id": row[1], "product_id": row[2],
+                "quantity": row[3], "amount": row[4], "payment_type": row[5],
+                "expires_at": row[6]}
+    return None
+
+def delete_pending_payment(code: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM pending_payments WHERE code=?", (code,))
+    conn.commit()
+    conn.close()
+
+def generate_code(prefix: str = "BN") -> str:
+    ts = datetime.now().strftime("%y%m%d%H%M%S")
+    rand = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    return f"{prefix}{ts}{rand}"
 
 # ================== TRANSLATIONS ==================
 LANGS = {
     "en": {
         "welcome": (
-            "🔥 <b>Welcome to SukoShop - Auto Order Bot</b>\n\n"
+            "🔥 <b>Welcome to SukoShop — Auto Order Bot</b>\n\n"
             "👋 Hello, <b>{name}</b>!\n\n"
             "📌 Quick guide:\n"
             "1. Click <b>Shop</b> to browse products.\n"
             "2. Choose the product you want.\n"
-            "3. Pay with your wallet balance.\n"
+            "3. Pay via Binance Pay or BEP20 wallet.\n"
             "4. After payment the bot delivers automatically.\n\n"
             "Please choose an option:"
         ),
@@ -35,35 +165,49 @@ LANGS = {
         "buy_now": "💳 Buy Now",
         "profile_title": "👤 <b>PROFILE</b>",
         "user_id": "User ID",
-        "name": "Name",
-        "balance": "Balance",
-        "referral": "Referral Link",
+        "name_label": "Name",
+        "balance_label": "Balance",
+        "referral_label": "Referral Link",
         "referral_desc": "Share your link and earn commission!",
         "history_title": "📜 <b>ORDER HISTORY</b>",
         "no_orders": "📜 You have no orders yet.",
         "wallet_title": "💰 <b>WALLET</b>",
         "usdt_balance": "USDT Balance",
-        "deposit_info": "➕ Deposit: Contact <a href='https://t.me/sukodeuva'>{admin}</a>",
-        "withdraw_info": "💸 Withdraw: Contact <a href='https://t.me/sukodeuva'>{admin}</a>",
         "deposit_btn": "➕ Deposit",
         "withdraw_btn": "💸 Withdraw",
-        "deposit_title": "➕ <b>DEPOSIT</b>",
-        "deposit_text": "To deposit USDT into your account:\n\n1. Contact <a href='https://t.me/sukodeuva'>{admin}</a>\n2. Send the amount you want to deposit\n3. Your balance will be updated after confirmation",
         "withdraw_title": "💸 <b>WITHDRAW</b>",
-        "withdraw_text": "To withdraw your balance:\n\n1. Contact <a href='https://t.me/sukodeuva'>{admin}</a>\n2. Send your wallet address and amount\n3. Withdrawal will be processed within 24h",
+        "withdraw_text": (
+            "To withdraw your balance:\n\n"
+            "1. Contact <a href='{admin_url}'>{admin}</a>\n"
+            "2. Send your BEP20 wallet address and amount\n"
+            "3. Withdrawal processed within 24h"
+        ),
         "support_title": "🛟 <b>SUPPORT</b>",
-        "support_text": "👤 Admin: <a href='https://t.me/sukodeuva'>{admin}</a>\n\n⏰ Working hours: 8h - 22h daily",
+        "support_text": "👤 Admin: <a href='{admin_url}'>{admin}</a>\n\n⏰ Working hours: 8h - 22h daily",
         "language_title": "🌐 <b>Choose Language</b>",
         "lang_changed": "Language changed to English!",
-        "order_placed": (
-            "✅ <b>Order placed!</b>\n\n"
-            "Product: {product}\n"
-            "Price: ${price}\n\n"
-            "Please send payment to {admin}\n"
-            "Your product will be delivered after confirmation."
-        ),
         "out_of_stock_alert": "Out of stock!",
-        "low_balance_alert": "Insufficient balance! Please deposit first.",
+        "enter_qty": "Enter quantity (1-{max}):\n\n💵 Your balance: <b>${balance:.2f} USDT</b>",
+        "invalid_qty": "Invalid quantity. Please enter a number between 1 and {max}.",
+        "insufficient_balance": "Insufficient balance! You need ${needed:.2f} USDT but have ${balance:.2f} USDT.\nPlease deposit first.",
+        "waiting_payment": "⏳ <b>WAITING FOR PAYMENT...</b>",
+        "payment_expired": "Payment expired. Please try again.",
+        "deposit_info_title": "💵 <b>USDT DEPOSIT INFO</b>",
+        "deposit_info_amount": "Amount",
+        "deposit_info_code": "Code",
+        "option1_title": "🔶 OPTION 1: BINANCE PAY (Instant, Free)",
+        "option1_binance_id": "Binance ID",
+        "option1_amount": "Amount",
+        "option1_note": "Note",
+        "option1_steps": "B. Binance → Pay → Send → paste ID above\n⚠️ Note MUST be exact!",
+        "option2_title": "🔷 OPTION 2: WALLET TRANSFER (BEP20)",
+        "option2_address": "Address",
+        "option2_network": "Network: <b>BEP20</b>",
+        "option2_amount": "Amount",
+        "option2_warning": "⚠️ Send EXACTLY this amount!\n⚠️ Use <b>BEP20</b> network ONLY!",
+        "auto_detect": "⏱ Auto-detection within 1-2 minutes.\nYou'll be notified when funds are added!",
+        "auto_detect_buy": "⏱ Auto-detection within 1-2 minutes.\nProduct will be delivered automatically!\n⏰ Payment expires in 10 minutes.",
+        "cancel_payment": "❌ Cancel",
         "btn_shop": "🛒 Shop",
         "btn_profile": "👤 Profile",
         "btn_history": "📜 Order History",
@@ -73,12 +217,12 @@ LANGS = {
     },
     "pt": {
         "welcome": (
-            "🔥 <b>Bem-vindo ao SukoShop - Bot de Pedido Automático</b>\n\n"
+            "🔥 <b>Bem-vindo ao SukoShop — Bot de Pedido Automático</b>\n\n"
             "👋 Olá, <b>{name}</b>!\n\n"
             "📌 Guia rápido:\n"
             "1. Clique em <b>Loja</b> para ver os produtos.\n"
             "2. Escolha o produto desejado.\n"
-            "3. Pague com o saldo da sua carteira.\n"
+            "3. Pague via Binance Pay ou carteira BEP20.\n"
             "4. Após o pagamento o bot entrega automaticamente.\n\n"
             "Escolha uma opção:"
         ),
@@ -92,35 +236,49 @@ LANGS = {
         "buy_now": "💳 Comprar Agora",
         "profile_title": "👤 <b>PERFIL</b>",
         "user_id": "ID do Usuário",
-        "name": "Nome",
-        "balance": "Saldo",
-        "referral": "Link de Indicação",
+        "name_label": "Nome",
+        "balance_label": "Saldo",
+        "referral_label": "Link de Indicação",
         "referral_desc": "Compartilhe seu link e ganhe comissão!",
         "history_title": "📜 <b>HISTÓRICO DE PEDIDOS</b>",
         "no_orders": "📜 Você ainda não tem pedidos.",
         "wallet_title": "💰 <b>CARTEIRA</b>",
         "usdt_balance": "Saldo USDT",
-        "deposit_info": "➕ Depositar: Contate <a href='https://t.me/sukodeuva'>{admin}</a>",
-        "withdraw_info": "💸 Sacar: Contate <a href='https://t.me/sukodeuva'>{admin}</a>",
         "deposit_btn": "➕ Depositar",
         "withdraw_btn": "💸 Sacar",
-        "deposit_title": "➕ <b>DEPÓSITO</b>",
-        "deposit_text": "Para depositar USDT:\n\n1. Contate <a href='https://t.me/sukodeuva'>{admin}</a>\n2. Informe o valor que deseja depositar\n3. Seu saldo será atualizado após confirmação",
         "withdraw_title": "💸 <b>SAQUE</b>",
-        "withdraw_text": "Para sacar seu saldo:\n\n1. Contate <a href='https://t.me/sukodeuva'>{admin}</a>\n2. Informe seu endereço de carteira e valor\n3. O saque será processado em até 24h",
+        "withdraw_text": (
+            "Para sacar seu saldo:\n\n"
+            "1. Contate <a href='{admin_url}'>{admin}</a>\n"
+            "2. Informe seu endereço BEP20 e o valor\n"
+            "3. Saque processado em até 24h"
+        ),
         "support_title": "🛟 <b>SUPORTE</b>",
-        "support_text": "👤 Admin: <a href='https://t.me/sukodeuva'>{admin}</a>\n\n⏰ Horário de atendimento: 8h - 22h",
+        "support_text": "👤 Admin: <a href='{admin_url}'>{admin}</a>\n\n⏰ Horário: 8h - 22h",
         "language_title": "🌐 <b>Escolha o Idioma</b>",
         "lang_changed": "Idioma alterado para Português!",
-        "order_placed": (
-            "✅ <b>Pedido realizado!</b>\n\n"
-            "Produto: {product}\n"
-            "Preço: ${price}\n\n"
-            "Envie o comprovante para {admin}\n"
-            "Seu produto será entregue após confirmação."
-        ),
         "out_of_stock_alert": "Produto esgotado!",
-        "low_balance_alert": "Saldo insuficiente! Faça um depósito primeiro.",
+        "enter_qty": "Digite a quantidade (1-{max}):\n\n💵 Seu saldo: <b>${balance:.2f} USDT</b>",
+        "invalid_qty": "Quantidade inválida. Digite um número entre 1 e {max}.",
+        "insufficient_balance": "Saldo insuficiente! Você precisa de ${needed:.2f} USDT mas tem ${balance:.2f} USDT.\nFaça um depósito primeiro.",
+        "waiting_payment": "⏳ <b>AGUARDANDO PAGAMENTO...</b>",
+        "payment_expired": "Pagamento expirado. Tente novamente.",
+        "deposit_info_title": "💵 <b>INFO DE DEPÓSITO USDT</b>",
+        "deposit_info_amount": "Valor",
+        "deposit_info_code": "Código",
+        "option1_title": "🔶 OPÇÃO 1: BINANCE PAY (Instantâneo, Grátis)",
+        "option1_binance_id": "ID Binance",
+        "option1_amount": "Valor",
+        "option1_note": "Nota",
+        "option1_steps": "B. Binance → Pay → Send → cole o ID acima\n⚠️ A nota DEVE ser exata!",
+        "option2_title": "🔷 OPÇÃO 2: TRANSFERÊNCIA CARTEIRA (BEP20)",
+        "option2_address": "Endereço",
+        "option2_network": "Rede: <b>BEP20</b>",
+        "option2_amount": "Valor",
+        "option2_warning": "⚠️ Envie EXATAMENTE este valor!\n⚠️ Use a rede <b>BEP20</b> APENAS!",
+        "auto_detect": "⏱ Detecção automática em 1-2 minutos.\nVocê será notificado quando o saldo for adicionado!",
+        "auto_detect_buy": "⏱ Detecção automática em 1-2 minutos.\nO produto será entregue automaticamente!\n⏰ Pagamento expira em 10 minutos.",
+        "cancel_payment": "❌ Cancelar",
         "btn_shop": "🛒 Loja",
         "btn_profile": "👤 Perfil",
         "btn_history": "📜 Histórico",
@@ -130,13 +288,13 @@ LANGS = {
     },
     "id": {
         "welcome": (
-            "🔥 <b>Selamat datang di SukoShop - Bot Pesanan Otomatis</b>\n\n"
+            "🔥 <b>Selamat datang di SukoShop — Bot Pesanan Otomatis</b>\n\n"
             "👋 Halo, <b>{name}</b>!\n\n"
             "📌 Panduan cepat:\n"
             "1. Klik <b>Toko</b> untuk melihat produk.\n"
             "2. Pilih produk yang Anda inginkan.\n"
-            "3. Bayar dengan saldo dompet Anda.\n"
-            "4. Setelah pembayaran bot akan otomatis mengirim.\n\n"
+            "3. Bayar via Binance Pay atau dompet BEP20.\n"
+            "4. Setelah pembayaran bot otomatis kirim.\n\n"
             "Pilih opsi:"
         ),
         "choose_option": "Pilih opsi:",
@@ -149,35 +307,49 @@ LANGS = {
         "buy_now": "💳 Beli Sekarang",
         "profile_title": "👤 <b>PROFIL</b>",
         "user_id": "ID Pengguna",
-        "name": "Nama",
-        "balance": "Saldo",
-        "referral": "Link Referral",
+        "name_label": "Nama",
+        "balance_label": "Saldo",
+        "referral_label": "Link Referral",
         "referral_desc": "Bagikan link Anda dan dapatkan komisi!",
         "history_title": "📜 <b>RIWAYAT PESANAN</b>",
         "no_orders": "📜 Anda belum memiliki pesanan.",
         "wallet_title": "💰 <b>DOMPET</b>",
         "usdt_balance": "Saldo USDT",
-        "deposit_info": "➕ Deposit: Hubungi <a href='https://t.me/sukodeuva'>{admin}</a>",
-        "withdraw_info": "💸 Tarik: Hubungi <a href='https://t.me/sukodeuva'>{admin}</a>",
         "deposit_btn": "➕ Deposit",
         "withdraw_btn": "💸 Tarik Dana",
-        "deposit_title": "➕ <b>DEPOSIT</b>",
-        "deposit_text": "Untuk deposit USDT:\n\n1. Hubungi <a href='https://t.me/sukodeuva'>{admin}</a>\n2. Kirim jumlah yang ingin Anda deposit\n3. Saldo akan diperbarui setelah konfirmasi",
         "withdraw_title": "💸 <b>TARIK DANA</b>",
-        "withdraw_text": "Untuk menarik saldo:\n\n1. Hubungi <a href='https://t.me/sukodeuva'>{admin}</a>\n2. Kirim alamat dompet dan jumlah Anda\n3. Penarikan diproses dalam 24 jam",
+        "withdraw_text": (
+            "Untuk menarik saldo:\n\n"
+            "1. Hubungi <a href='{admin_url}'>{admin}</a>\n"
+            "2. Kirim alamat BEP20 dan jumlah Anda\n"
+            "3. Penarikan diproses dalam 24 jam"
+        ),
         "support_title": "🛟 <b>DUKUNGAN</b>",
-        "support_text": "👤 Admin: <a href='https://t.me/sukodeuva'>{admin}</a>\n\n⏰ Jam kerja: 8 - 22 setiap hari",
+        "support_text": "👤 Admin: <a href='{admin_url}'>{admin}</a>\n\n⏰ Jam kerja: 8 - 22 setiap hari",
         "language_title": "🌐 <b>Pilih Bahasa</b>",
         "lang_changed": "Bahasa diubah ke Indonesia!",
-        "order_placed": (
-            "✅ <b>Pesanan berhasil!</b>\n\n"
-            "Produk: {product}\n"
-            "Harga: ${price}\n\n"
-            "Kirim bukti pembayaran ke {admin}\n"
-            "Produk akan dikirim setelah konfirmasi."
-        ),
         "out_of_stock_alert": "Stok habis!",
-        "low_balance_alert": "Saldo tidak cukup! Silakan deposit terlebih dahulu.",
+        "enter_qty": "Masukkan jumlah (1-{max}):\n\n💵 Saldo Anda: <b>${balance:.2f} USDT</b>",
+        "invalid_qty": "Jumlah tidak valid. Masukkan angka antara 1 dan {max}.",
+        "insufficient_balance": "Saldo tidak cukup! Anda butuh ${needed:.2f} USDT tapi punya ${balance:.2f} USDT.\nSilakan deposit dulu.",
+        "waiting_payment": "⏳ <b>MENUNGGU PEMBAYARAN...</b>",
+        "payment_expired": "Pembayaran kadaluarsa. Coba lagi.",
+        "deposit_info_title": "💵 <b>INFO DEPOSIT USDT</b>",
+        "deposit_info_amount": "Jumlah",
+        "deposit_info_code": "Kode",
+        "option1_title": "🔶 OPSI 1: BINANCE PAY (Instan, Gratis)",
+        "option1_binance_id": "ID Binance",
+        "option1_amount": "Jumlah",
+        "option1_note": "Catatan",
+        "option1_steps": "B. Binance → Pay → Send → tempel ID di atas\n⚠️ Catatan HARUS tepat!",
+        "option2_title": "🔷 OPSI 2: TRANSFER DOMPET (BEP20)",
+        "option2_address": "Alamat",
+        "option2_network": "Jaringan: <b>BEP20</b>",
+        "option2_amount": "Jumlah",
+        "option2_warning": "⚠️ Kirim TEPAT jumlah ini!\n⚠️ Gunakan jaringan <b>BEP20</b> SAJA!",
+        "auto_detect": "⏱ Deteksi otomatis dalam 1-2 menit.\nAnda akan diberi tahu saat dana ditambahkan!",
+        "auto_detect_buy": "⏱ Deteksi otomatis dalam 1-2 menit.\nProduk akan dikirim otomatis!\n⏰ Pembayaran kadaluarsa dalam 10 menit.",
+        "cancel_payment": "❌ Batal",
         "btn_shop": "🛒 Toko",
         "btn_profile": "👤 Profil",
         "btn_history": "📜 Riwayat",
@@ -187,12 +359,12 @@ LANGS = {
     },
     "hi": {
         "welcome": (
-            "🔥 <b>SukoShop में आपका स्वागत है - ऑटो ऑर्डर बॉट</b>\n\n"
+            "🔥 <b>SukoShop में आपका स्वागत है — ऑटो ऑर्डर बॉट</b>\n\n"
             "👋 नमस्ते, <b>{name}</b>!\n\n"
             "📌 त्वरित गाइड:\n"
-            "1. उत्पाद देखने के लिए <b>शॉप</b> पर क्लिक करें।\n"
-            "2. अपना उत्पाद चुनें।\n"
-            "3. वॉलेट बैलेंस से भुगतान करें।\n"
+            "1. <b>शॉप</b> पर क्लिक करें।\n"
+            "2. उत्पाद चुनें।\n"
+            "3. Binance Pay या BEP20 से भुगतान करें।\n"
             "4. भुगतान के बाद बॉट स्वतः डिलीवर करेगा।\n\n"
             "एक विकल्प चुनें:"
         ),
@@ -206,35 +378,49 @@ LANGS = {
         "buy_now": "💳 अभी खरीदें",
         "profile_title": "👤 <b>प्रोफ़ाइल</b>",
         "user_id": "यूजर आईडी",
-        "name": "नाम",
-        "balance": "बैलेंस",
-        "referral": "रेफरल लिंक",
+        "name_label": "नाम",
+        "balance_label": "बैलेंस",
+        "referral_label": "रेफरल लिंक",
         "referral_desc": "अपना लिंक शेयर करें और कमीशन कमाएं!",
         "history_title": "📜 <b>ऑर्डर हिस्ट्री</b>",
-        "no_orders": "📜 आपके कोई ऑर्डर नहीं हैं।",
+        "no_orders": "📜 अभी तक कोई ऑर्डर नहीं।",
         "wallet_title": "💰 <b>वॉलेट</b>",
         "usdt_balance": "USDT बैलेंस",
-        "deposit_info": "➕ डिपॉजिट: <a href='https://t.me/sukodeuva'>{admin}</a> से संपर्क करें",
-        "withdraw_info": "💸 निकासी: <a href='https://t.me/sukodeuva'>{admin}</a> से संपर्क करें",
         "deposit_btn": "➕ डिपॉजिट",
         "withdraw_btn": "💸 निकासी",
-        "deposit_title": "➕ <b>डिपॉजिट</b>",
-        "deposit_text": "USDT डिपॉजिट करने के लिए:\n\n1. <a href='https://t.me/sukodeuva'>{admin}</a> से संपर्क करें\n2. राशि भेजें\n3. पुष्टि के बाद बैलेंस अपडेट होगा",
         "withdraw_title": "💸 <b>निकासी</b>",
-        "withdraw_text": "बैलेंस निकालने के लिए:\n\n1. <a href='https://t.me/sukodeuva'>{admin}</a> से संपर्क करें\n2. अपना वॉलेट पता और राशि भेजें\n3. 24 घंटे में प्रोसेस होगा",
+        "withdraw_text": (
+            "बैलेंस निकालने के लिए:\n\n"
+            "1. <a href='{admin_url}'>{admin}</a> से संपर्क करें\n"
+            "2. BEP20 पता और राशि भेजें\n"
+            "3. 24 घंटे में प्रोसेस होगा"
+        ),
         "support_title": "🛟 <b>सहायता</b>",
-        "support_text": "👤 एडमिन: <a href='https://t.me/sukodeuva'>{admin}</a>\n\n⏰ काम के घंटे: सुबह 8 - रात 10",
+        "support_text": "👤 एडमिन: <a href='{admin_url}'>{admin}</a>\n\n⏰ समय: सुबह 8 - रात 10",
         "language_title": "🌐 <b>भाषा चुनें</b>",
         "lang_changed": "भाषा हिंदी में बदली!",
-        "order_placed": (
-            "✅ <b>ऑर्डर हो गया!</b>\n\n"
-            "उत्पाद: {product}\n"
-            "कीमत: ${price}\n\n"
-            "भुगतान प्रमाण {admin} को भेजें\n"
-            "पुष्टि के बाद उत्पाद मिलेगा।"
-        ),
         "out_of_stock_alert": "स्टॉक खत्म!",
-        "low_balance_alert": "अपर्याप्त बैलेंस! पहले डिपॉजिट करें।",
+        "enter_qty": "मात्रा दर्ज करें (1-{max}):\n\n💵 आपका बैलेंस: <b>${balance:.2f} USDT</b>",
+        "invalid_qty": "अमान्य मात्रा। 1 और {max} के बीच संख्या दर्ज करें।",
+        "insufficient_balance": "बैलेंस कम है! आपको ${needed:.2f} USDT चाहिए लेकिन है ${balance:.2f} USDT।\nपहले डिपॉजिट करें।",
+        "waiting_payment": "⏳ <b>भुगतान का इंतजार...</b>",
+        "payment_expired": "भुगतान समय समाप्त। फिर कोशिश करें।",
+        "deposit_info_title": "💵 <b>USDT डिपॉजिट जानकारी</b>",
+        "deposit_info_amount": "राशि",
+        "deposit_info_code": "कोड",
+        "option1_title": "🔶 विकल्प 1: BINANCE PAY (तत्काल, मुफ्त)",
+        "option1_binance_id": "Binance ID",
+        "option1_amount": "राशि",
+        "option1_note": "नोट",
+        "option1_steps": "B. Binance → Pay → Send → ऊपर ID पेस्ट करें\n⚠️ नोट बिल्कुल सही होना चाहिए!",
+        "option2_title": "🔷 विकल्प 2: वॉलेट ट्रांसफर (BEP20)",
+        "option2_address": "पता",
+        "option2_network": "नेटवर्क: <b>BEP20</b>",
+        "option2_amount": "राशि",
+        "option2_warning": "⚠️ बिल्कुल यही राशि भेजें!\n⚠️ केवल <b>BEP20</b> नेटवर्क उपयोग करें!",
+        "auto_detect": "⏱ 1-2 मिनट में स्वतः पहचान।\nराशि जुड़ने पर सूचना मिलेगी!",
+        "auto_detect_buy": "⏱ 1-2 मिनट में स्वतः पहचान।\nउत्पाद स्वतः डिलीवर होगा!\n⏰ भुगतान 10 मिनट में समाप्त।",
+        "cancel_payment": "❌ रद्द करें",
         "btn_shop": "🛒 शॉप",
         "btn_profile": "👤 प्रोफ़ाइल",
         "btn_history": "📜 हिस्ट्री",
@@ -244,13 +430,13 @@ LANGS = {
     },
     "th": {
         "welcome": (
-            "🔥 <b>ยินดีต้อนรับสู่ SukoShop - บอทสั่งซื้ออัตโนมัติ</b>\n\n"
+            "🔥 <b>ยินดีต้อนรับสู่ SukoShop — บอทสั่งซื้ออัตโนมัติ</b>\n\n"
             "👋 สวัสดี, <b>{name}</b>!\n\n"
             "📌 คู่มือด่วน:\n"
             "1. คลิก <b>ร้านค้า</b> เพื่อดูสินค้า\n"
             "2. เลือกสินค้าที่ต้องการ\n"
-            "3. ชำระด้วยยอดคงเหลือในกระเป๋า\n"
-            "4. หลังชำระบอทจะส่งสินค้าอัตโนมัติ\n\n"
+            "3. ชำระผ่าน Binance Pay หรือ BEP20\n"
+            "4. หลังชำระบอทส่งสินค้าอัตโนมัติ\n\n"
             "กรุณาเลือกตัวเลือก:"
         ),
         "choose_option": "กรุณาเลือกตัวเลือก:",
@@ -263,35 +449,49 @@ LANGS = {
         "buy_now": "💳 ซื้อเลย",
         "profile_title": "👤 <b>โปรไฟล์</b>",
         "user_id": "รหัสผู้ใช้",
-        "name": "ชื่อ",
-        "balance": "ยอดคงเหลือ",
-        "referral": "ลิงก์แนะนำ",
+        "name_label": "ชื่อ",
+        "balance_label": "ยอดคงเหลือ",
+        "referral_label": "ลิงก์แนะนำ",
         "referral_desc": "แชร์ลิงก์ของคุณเพื่อรับค่าคอมมิชชั่น!",
         "history_title": "📜 <b>ประวัติการสั่งซื้อ</b>",
         "no_orders": "📜 คุณยังไม่มีคำสั่งซื้อ",
         "wallet_title": "💰 <b>กระเป๋าเงิน</b>",
         "usdt_balance": "ยอด USDT",
-        "deposit_info": "➕ ฝากเงิน: ติดต่อ <a href='https://t.me/sukodeuva'>{admin}</a>",
-        "withdraw_info": "💸 ถอนเงิน: ติดต่อ <a href='https://t.me/sukodeuva'>{admin}</a>",
         "deposit_btn": "➕ ฝากเงิน",
         "withdraw_btn": "💸 ถอนเงิน",
-        "deposit_title": "➕ <b>ฝากเงิน</b>",
-        "deposit_text": "วิธีฝาก USDT:\n\n1. ติดต่อ <a href='https://t.me/sukodeuva'>{admin}</a>\n2. แจ้งจำนวนที่ต้องการฝาก\n3. ยอดจะอัปเดตหลังยืนยัน",
         "withdraw_title": "💸 <b>ถอนเงิน</b>",
-        "withdraw_text": "วิธีถอนยอดคงเหลือ:\n\n1. ติดต่อ <a href='https://t.me/sukodeuva'>{admin}</a>\n2. แจ้งที่อยู่กระเป๋าและจำนวน\n3. ดำเนินการภายใน 24 ชั่วโมง",
+        "withdraw_text": (
+            "วิธีถอนยอดคงเหลือ:\n\n"
+            "1. ติดต่อ <a href='{admin_url}'>{admin}</a>\n"
+            "2. แจ้งที่อยู่ BEP20 และจำนวน\n"
+            "3. ดำเนินการภายใน 24 ชั่วโมง"
+        ),
         "support_title": "🛟 <b>ฝ่ายสนับสนุน</b>",
-        "support_text": "👤 แอดมิน: <a href='https://t.me/sukodeuva'>{admin}</a>\n\n⏰ เวลาทำการ: 8 - 22 น. ทุกวัน",
+        "support_text": "👤 แอดมิน: <a href='{admin_url}'>{admin}</a>\n\n⏰ เวลาทำการ: 8 - 22 น. ทุกวัน",
         "language_title": "🌐 <b>เลือกภาษา</b>",
         "lang_changed": "เปลี่ยนภาษาเป็นภาษาไทย!",
-        "order_placed": (
-            "✅ <b>สั่งซื้อสำเร็จ!</b>\n\n"
-            "สินค้า: {product}\n"
-            "ราคา: ${price}\n\n"
-            "ส่งหลักฐานการชำระให้ {admin}\n"
-            "สินค้าจะถูกส่งหลังยืนยัน"
-        ),
         "out_of_stock_alert": "สินค้าหมด!",
-        "low_balance_alert": "ยอดคงเหลือไม่เพียงพอ! กรุณาฝากเงินก่อน",
+        "enter_qty": "ป้อนจำนวน (1-{max}):\n\n💵 ยอดของคุณ: <b>${balance:.2f} USDT</b>",
+        "invalid_qty": "จำนวนไม่ถูกต้อง กรุณาป้อนตัวเลขระหว่าง 1 ถึง {max}",
+        "insufficient_balance": "ยอดไม่เพียงพอ! คุณต้องการ ${needed:.2f} USDT แต่มี ${balance:.2f} USDT\nกรุณาฝากเงินก่อน",
+        "waiting_payment": "⏳ <b>รอการชำระเงิน...</b>",
+        "payment_expired": "การชำระเงินหมดเวลา กรุณาลองใหม่",
+        "deposit_info_title": "💵 <b>ข้อมูลฝาก USDT</b>",
+        "deposit_info_amount": "จำนวน",
+        "deposit_info_code": "รหัส",
+        "option1_title": "🔶 ตัวเลือก 1: BINANCE PAY (ทันที, ฟรี)",
+        "option1_binance_id": "Binance ID",
+        "option1_amount": "จำนวน",
+        "option1_note": "หมายเหตุ",
+        "option1_steps": "B. Binance → Pay → Send → วาง ID ด้านบน\n⚠️ หมายเหตุต้องถูกต้องทุกตัวอักษร!",
+        "option2_title": "🔷 ตัวเลือก 2: โอนกระเป๋า (BEP20)",
+        "option2_address": "ที่อยู่",
+        "option2_network": "เครือข่าย: <b>BEP20</b>",
+        "option2_amount": "จำนวน",
+        "option2_warning": "⚠️ ส่งจำนวนนี้เท่านั้น!\n⚠️ ใช้เครือข่าย <b>BEP20</b> เท่านั้น!",
+        "auto_detect": "⏱ ตรวจจับอัตโนมัติภายใน 1-2 นาที\nคุณจะได้รับแจ้งเมื่อเงินเข้า!",
+        "auto_detect_buy": "⏱ ตรวจจับอัตโนมัติภายใน 1-2 นาที\nสินค้าจะถูกส่งอัตโนมัติ!\n⏰ การชำระเงินหมดอายุใน 10 นาที",
+        "cancel_payment": "❌ ยกเลิก",
         "btn_shop": "🛒 ร้านค้า",
         "btn_profile": "👤 โปรไฟล์",
         "btn_history": "📜 ประวัติ",
@@ -301,12 +501,12 @@ LANGS = {
     },
     "zh": {
         "welcome": (
-            "🔥 <b>欢迎来到 SukoShop - 自动订购机器人</b>\n\n"
+            "🔥 <b>欢迎来到 SukoShop — 自动订购机器人</b>\n\n"
             "👋 你好, <b>{name}</b>!\n\n"
             "📌 快速指南:\n"
             "1. 点击<b>商店</b>浏览商品。\n"
             "2. 选择您想要的商品。\n"
-            "3. 用钱包余额支付。\n"
+            "3. 通过 Binance Pay 或 BEP20 付款。\n"
             "4. 付款后机器人自动发货。\n\n"
             "请选择一个选项:"
         ),
@@ -320,35 +520,49 @@ LANGS = {
         "buy_now": "💳 立即购买",
         "profile_title": "👤 <b>个人资料</b>",
         "user_id": "用户ID",
-        "name": "姓名",
-        "balance": "余额",
-        "referral": "推荐链接",
+        "name_label": "姓名",
+        "balance_label": "余额",
+        "referral_label": "推荐链接",
         "referral_desc": "分享您的链接并赚取佣金！",
         "history_title": "📜 <b>订单历史</b>",
         "no_orders": "📜 您还没有订单。",
         "wallet_title": "💰 <b>钱包</b>",
         "usdt_balance": "USDT余额",
-        "deposit_info": "➕ 充值: 联系 <a href='https://t.me/sukodeuva'>{admin}</a>",
-        "withdraw_info": "💸 提现: 联系 <a href='https://t.me/sukodeuva'>{admin}</a>",
         "deposit_btn": "➕ 充值",
         "withdraw_btn": "💸 提现",
-        "deposit_title": "➕ <b>充值</b>",
-        "deposit_text": "充值USDT:\n\n1. 联系 <a href='https://t.me/sukodeuva'>{admin}</a>\n2. 发送充值金额\n3. 确认后余额更新",
         "withdraw_title": "💸 <b>提现</b>",
-        "withdraw_text": "提取余额:\n\n1. 联系 <a href='https://t.me/sukodeuva'>{admin}</a>\n2. 发送您的钱包地址和金额\n3. 24小时内处理",
+        "withdraw_text": (
+            "提取余额:\n\n"
+            "1. 联系 <a href='{admin_url}'>{admin}</a>\n"
+            "2. 发送您的 BEP20 地址和金额\n"
+            "3. 24小时内处理"
+        ),
         "support_title": "🛟 <b>客服支持</b>",
-        "support_text": "👤 管理员: <a href='https://t.me/sukodeuva'>{admin}</a>\n\n⏰ 工作时间: 每天 8 - 22 点",
+        "support_text": "👤 管理员: <a href='{admin_url}'>{admin}</a>\n\n⏰ 工作时间: 每天 8 - 22 点",
         "language_title": "🌐 <b>选择语言</b>",
         "lang_changed": "语言已更改为中文！",
-        "order_placed": (
-            "✅ <b>下单成功！</b>\n\n"
-            "商品: {product}\n"
-            "价格: ${price}\n\n"
-            "请将付款凭证发送给 {admin}\n"
-            "确认后商品将自动发送。"
-        ),
         "out_of_stock_alert": "缺货！",
-        "low_balance_alert": "余额不足！请先充值。",
+        "enter_qty": "输入数量 (1-{max}):\n\n💵 您的余额: <b>${balance:.2f} USDT</b>",
+        "invalid_qty": "数量无效，请输入 1 到 {max} 之间的数字。",
+        "insufficient_balance": "余额不足！您需要 ${needed:.2f} USDT，但只有 ${balance:.2f} USDT。\n请先充值。",
+        "waiting_payment": "⏳ <b>等待付款...</b>",
+        "payment_expired": "付款已过期，请重试。",
+        "deposit_info_title": "💵 <b>USDT 充值信息</b>",
+        "deposit_info_amount": "金额",
+        "deposit_info_code": "代码",
+        "option1_title": "🔶 选项 1: BINANCE PAY (即时, 免费)",
+        "option1_binance_id": "Binance ID",
+        "option1_amount": "金额",
+        "option1_note": "备注",
+        "option1_steps": "B. Binance → Pay → Send → 粘贴上方ID\n⚠️ 备注必须完全一致!",
+        "option2_title": "🔷 选项 2: 钱包转账 (BEP20)",
+        "option2_address": "地址",
+        "option2_network": "网络: <b>BEP20</b>",
+        "option2_amount": "金额",
+        "option2_warning": "⚠️ 必须发送准确金额!\n⚠️ 只使用 <b>BEP20</b> 网络!",
+        "auto_detect": "⏱ 1-2分钟内自动检测。\n资金到账后将通知您！",
+        "auto_detect_buy": "⏱ 1-2分钟内自动检测。\n产品将自动发送！\n⏰ 付款将在10分钟后过期。",
+        "cancel_payment": "❌ 取消",
         "btn_shop": "🛒 商店",
         "btn_profile": "👤 个人资料",
         "btn_history": "📜 订单历史",
@@ -358,12 +572,12 @@ LANGS = {
     },
     "es": {
         "welcome": (
-            "🔥 <b>Bienvenido a SukoShop - Bot de Pedido Automático</b>\n\n"
+            "🔥 <b>Bienvenido a SukoShop — Bot de Pedido Automático</b>\n\n"
             "👋 Hola, <b>{name}</b>!\n\n"
             "📌 Guía rápida:\n"
-            "1. Haz clic en <b>Tienda</b> para ver los productos.\n"
+            "1. Haz clic en <b>Tienda</b> para ver productos.\n"
             "2. Elige el producto que deseas.\n"
-            "3. Paga con el saldo de tu billetera.\n"
+            "3. Paga via Binance Pay o billetera BEP20.\n"
             "4. Tras el pago el bot entrega automáticamente.\n\n"
             "Elige una opción:"
         ),
@@ -377,35 +591,49 @@ LANGS = {
         "buy_now": "💳 Comprar Ahora",
         "profile_title": "👤 <b>PERFIL</b>",
         "user_id": "ID de Usuario",
-        "name": "Nombre",
-        "balance": "Saldo",
-        "referral": "Link de Referido",
+        "name_label": "Nombre",
+        "balance_label": "Saldo",
+        "referral_label": "Link de Referido",
         "referral_desc": "Comparte tu link y gana comisión!",
         "history_title": "📜 <b>HISTORIAL DE PEDIDOS</b>",
         "no_orders": "📜 Aún no tienes pedidos.",
         "wallet_title": "💰 <b>BILLETERA</b>",
         "usdt_balance": "Saldo USDT",
-        "deposit_info": "➕ Depositar: Contacta <a href='https://t.me/sukodeuva'>{admin}</a>",
-        "withdraw_info": "💸 Retirar: Contacta <a href='https://t.me/sukodeuva'>{admin}</a>",
         "deposit_btn": "➕ Depositar",
         "withdraw_btn": "💸 Retirar",
-        "deposit_title": "➕ <b>DEPÓSITO</b>",
-        "deposit_text": "Para depositar USDT:\n\n1. Contacta <a href='https://t.me/sukodeuva'>{admin}</a>\n2. Envía el monto que deseas depositar\n3. Tu saldo se actualizará tras confirmación",
         "withdraw_title": "💸 <b>RETIRO</b>",
-        "withdraw_text": "Para retirar tu saldo:\n\n1. Contacta <a href='https://t.me/sukodeuva'>{admin}</a>\n2. Envía tu dirección de billetera y monto\n3. El retiro se procesa en 24h",
+        "withdraw_text": (
+            "Para retirar tu saldo:\n\n"
+            "1. Contacta <a href='{admin_url}'>{admin}</a>\n"
+            "2. Envía tu dirección BEP20 y monto\n"
+            "3. El retiro se procesa en 24h"
+        ),
         "support_title": "🛟 <b>SOPORTE</b>",
-        "support_text": "👤 Admin: <a href='https://t.me/sukodeuva'>{admin}</a>\n\n⏰ Horario: 8h - 22h todos los días",
+        "support_text": "👤 Admin: <a href='{admin_url}'>{admin}</a>\n\n⏰ Horario: 8h - 22h todos los días",
         "language_title": "🌐 <b>Elegir Idioma</b>",
         "lang_changed": "Idioma cambiado a Español!",
-        "order_placed": (
-            "✅ <b>Pedido realizado!</b>\n\n"
-            "Producto: {product}\n"
-            "Precio: ${price}\n\n"
-            "Envía el comprobante de pago a {admin}\n"
-            "Tu producto será entregado tras confirmación."
-        ),
         "out_of_stock_alert": "Sin stock!",
-        "low_balance_alert": "Saldo insuficiente! Por favor deposita primero.",
+        "enter_qty": "Ingresa cantidad (1-{max}):\n\n💵 Tu saldo: <b>${balance:.2f} USDT</b>",
+        "invalid_qty": "Cantidad inválida. Ingresa un número entre 1 y {max}.",
+        "insufficient_balance": "Saldo insuficiente! Necesitas ${needed:.2f} USDT pero tienes ${balance:.2f} USDT.\nDeposita primero.",
+        "waiting_payment": "⏳ <b>ESPERANDO PAGO...</b>",
+        "payment_expired": "Pago expirado. Intenta de nuevo.",
+        "deposit_info_title": "💵 <b>INFO DE DEPÓSITO USDT</b>",
+        "deposit_info_amount": "Monto",
+        "deposit_info_code": "Código",
+        "option1_title": "🔶 OPCIÓN 1: BINANCE PAY (Instantáneo, Gratis)",
+        "option1_binance_id": "Binance ID",
+        "option1_amount": "Monto",
+        "option1_note": "Nota",
+        "option1_steps": "B. Binance → Pay → Send → pega el ID arriba\n⚠️ La nota DEBE ser exacta!",
+        "option2_title": "🔷 OPCIÓN 2: TRANSFERENCIA BILLETERA (BEP20)",
+        "option2_address": "Dirección",
+        "option2_network": "Red: <b>BEP20</b>",
+        "option2_amount": "Monto",
+        "option2_warning": "⚠️ Envía EXACTAMENTE este monto!\n⚠️ Usa red <b>BEP20</b> SOLO!",
+        "auto_detect": "⏱ Detección automática en 1-2 minutos.\nSe te notificará cuando los fondos se añadan!",
+        "auto_detect_buy": "⏱ Detección automática en 1-2 minutos.\nEl producto se entregará automáticamente!\n⏰ El pago expira en 10 minutos.",
+        "cancel_payment": "❌ Cancelar",
         "btn_shop": "🛒 Tienda",
         "btn_profile": "👤 Perfil",
         "btn_history": "📜 Historial",
@@ -415,7 +643,7 @@ LANGS = {
     },
 }
 
-# ================== PRODUTOS ==================
+# ================== PRODUCTS ==================
 products = {
     "1": {
         "name": "Grok Super 3M (FW)",
@@ -423,7 +651,7 @@ products = {
         "stock": 39,
         "emoji": "🤖",
         "desc": (
-            "🤖 <b>Grok Super - 3 Month (Family Warranty)</b>\n\n"
+            "🤖 <b>Grok Super — 3 Month (Family Warranty)</b>\n\n"
             "💵 Price: <b>$12.00 USDT</b>\n"
             "📦 In stock: 39\n\n"
             "✅ Full warranty 3 months\n"
@@ -439,7 +667,7 @@ products = {
         "stock": 3,
         "emoji": "🤖",
         "desc": (
-            "🤖 <b>Grok Super - 6 Month (Family Warranty)</b>\n\n"
+            "🤖 <b>Grok Super — 6 Month (Family Warranty)</b>\n\n"
             "💵 Price: <b>$19.00 USDT</b>\n"
             "📦 In stock: 3\n\n"
             "✅ Full warranty 6 months\n"
@@ -455,12 +683,12 @@ products = {
         "stock": 53,
         "emoji": "✨",
         "desc": (
-            "✨ <b>Gemini Pro Link - 18 Months</b>\n\n"
+            "✨ <b>Gemini Pro Link — 18 Months</b>\n\n"
             "💵 Price: <b>$1.50 USDT</b>\n"
             "📦 In stock: 53\n\n"
             "✅ 24 hours holding warranty\n"
             "✅ Click on the link and confirm\n"
-            "✅ Do not need Card\n"
+            "✅ No credit card needed\n"
             "✅ Can be used on any account\n"
             "✅ Can invite 5 more members to family\n"
             "✅ Instant delivery after payment"
@@ -472,7 +700,7 @@ products = {
         "stock": 30,
         "emoji": "🎬",
         "desc": (
-            "🎬 <b>Capcut Pro Team - 1 Month Full Date (Family Warranty)</b>\n\n"
+            "🎬 <b>Capcut Pro Team — 1 Month Full Date (Family Warranty)</b>\n\n"
             "💵 Price: <b>$2.50 USDT</b>\n"
             "📦 In stock: 30\n\n"
             "✅ Full Date warranty\n"
@@ -488,12 +716,12 @@ products = {
         "stock": 0,
         "emoji": "💬",
         "desc": (
-            "💬 <b>ChatGPT Plus Shared - 1 Month (No Warranty)</b>\n\n"
+            "💬 <b>ChatGPT Plus Shared — 1 Month (No Warranty)</b>\n\n"
             "💵 Price: <b>$2.00 USDT</b>\n"
             "📦 Out of stock\n\n"
             "• High quality shared account\n"
             "• Instant delivery after payment\n"
-            "• No warranty - sold as is"
+            "• No warranty — sold as is"
         ),
     },
     "6": {
@@ -502,12 +730,12 @@ products = {
         "stock": 0,
         "emoji": "🎨",
         "desc": (
-            "🎨 <b>Adobe Creative Cloud - 1 Month (No Warranty)</b>\n\n"
+            "🎨 <b>Adobe Creative Cloud — 1 Month (No Warranty)</b>\n\n"
             "💵 Price: <b>$0.50 USDT</b>\n"
             "📦 Out of stock\n\n"
             "• Full Creative Cloud access\n"
             "• All Adobe apps included\n"
-            "• No warranty - sold as is"
+            "• No warranty — sold as is"
         ),
     },
     "7": {
@@ -516,7 +744,7 @@ products = {
         "stock": 0,
         "emoji": "🎙️",
         "desc": (
-            "🎙️ <b>ElevenLabs - 3 Month (Family Warranty)</b>\n\n"
+            "🎙️ <b>ElevenLabs — 3 Month (Family Warranty)</b>\n\n"
             "💵 Price: <b>$15.00 USDT</b>\n"
             "📦 Out of stock\n\n"
             "✅ Premium voice AI access\n"
@@ -527,28 +755,18 @@ products = {
     },
 }
 
-# ================== USER DATA (mock) ==================
-user_data = {}
+# Tracks users waiting to type qty: {user_id: {"product_id": str, "message_id": int}}
+awaiting_qty = {}
 
-def get_user(user_id: int, name: str = None):
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "balance": 0.0,
-            "orders": [],
-            "name": name or "User",
-            "lang": "en",
-            "referral": f"https://t.me/SukoShopBot?start={user_id}"
-        }
-    return user_data[user_id]
-
-def t(user_id: int, key: str, **kwargs):
-    user = user_data.get(user_id, {})
+# ================== HELPERS ==================
+def t(user_id: int, key: str, **kwargs) -> str:
+    user = get_user(user_id)
     lang = user.get("lang", "en")
     strings = LANGS.get(lang, LANGS["en"])
     text = strings.get(key, LANGS["en"].get(key, key))
-    return text.format(admin=ADMIN, **kwargs)
+    return text.format(admin=ADMIN, admin_url=ADMIN_URL, **kwargs)
 
-def main_menu_kb(user_id: int):
+def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=t(user_id, "btn_shop"), callback_data="shop")],
         [
@@ -562,7 +780,52 @@ def main_menu_kb(user_id: int):
         ],
     ])
 
+def build_payment_message(uid: int, amount: float, code: str, is_deposit: bool = True) -> str:
+    bep20_amount = round(amount + 0.0034, 4)
+    lines = []
+
+    if is_deposit:
+        lines.append(t(uid, "deposit_info_title"))
+        lines.append("")
+        lines.append(f"💵 {t(uid, 'deposit_info_amount')}: <b>{amount} USDT</b>")
+        lines.append(f"🔖 {t(uid, 'deposit_info_code')}: <code>{code}</code>")
+    else:
+        lines.append(t(uid, "waiting_payment"))
+
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🔶 <b>{t(uid, 'option1_title')}</b>")
+    lines.append("")
+    lines.append(f"🆔 {t(uid, 'option1_binance_id')}:")
+    lines.append(f"<code>{BINANCE_ID}</code>")
+    lines.append(f"💵 {t(uid, 'option1_amount')}:")
+    lines.append(f"<code>{amount}</code>")
+    lines.append(f"📝 {t(uid, 'option1_note')}:")
+    lines.append(f"<code>{code}</code>")
+    lines.append("")
+    lines.append(t(uid, "option1_steps"))
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🔷 <b>{t(uid, 'option2_title')}</b>")
+    lines.append("")
+    lines.append(f"📍 {t(uid, 'option2_address')}:")
+    lines.append(f"<code>{BEP20_ADDRESS}</code>")
+    lines.append(f"🔗 {t(uid, 'option2_network')}")
+    lines.append(f"💵 {t(uid, 'option2_amount')}:")
+    lines.append(f"<code>{bep20_amount}</code>")
+    lines.append("")
+    lines.append(t(uid, "option2_warning"))
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    if is_deposit:
+        lines.append(t(uid, "auto_detect"))
+    else:
+        lines.append(t(uid, "auto_detect_buy"))
+
+    return "\n".join(lines)
+
 # ================== HANDLERS ==================
+
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     user = get_user(message.from_user.id, message.from_user.first_name)
@@ -574,10 +837,13 @@ async def start_cmd(message: types.Message):
 
 @dp.callback_query(F.data == "main_menu")
 async def back_to_main(callback: types.CallbackQuery):
-    get_user(callback.from_user.id)
+    uid = callback.from_user.id
+    get_user(uid)
+    awaiting_qty.pop(uid, None)
     await callback.message.edit_text(
-        t(callback.from_user.id, "choose_option"),
-        reply_markup=main_menu_kb(callback.from_user.id)
+        t(uid, "choose_option"),
+        reply_markup=main_menu_kb(uid),
+        parse_mode="HTML"
     )
 
 # ---------- SHOP ----------
@@ -588,9 +854,9 @@ async def shop_menu(callback: types.CallbackQuery):
     kb = []
     for pid, p in products.items():
         if p["stock"] > 0:
-            label = f"{p['emoji']} {p['name']} - ${p['price']} ({t(uid, 'in_stock')} {p['stock']})"
+            label = f"{p['emoji']} {p['name']} — ${p['price']} ({t(uid, 'in_stock')} {p['stock']})"
         else:
-            label = f"🔴 {p['name']} - ${p['price']} ({t(uid, 'out_of_stock')})"
+            label = f"🔴 {p['name']} — ${p['price']} ({t(uid, 'out_of_stock')})"
         kb.append([InlineKeyboardButton(text=label, callback_data=f"product_{pid}")])
     kb.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="shop")])
     kb.append([InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")])
@@ -609,12 +875,10 @@ async def show_product(callback: types.CallbackQuery):
     if not p:
         await callback.answer("Product not found.", show_alert=True)
         return
-
     kb = []
     if p["stock"] > 0:
         kb.append([InlineKeyboardButton(text=t(uid, "buy_now"), callback_data=f"buy_{pid}")])
     kb.append([InlineKeyboardButton(text=t(uid, "back_to_shop"), callback_data="shop")])
-
     await callback.message.edit_text(
         p["desc"],
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
@@ -632,22 +896,102 @@ async def buy_product(callback: types.CallbackQuery):
         await callback.answer(t(uid, "out_of_stock_alert"), show_alert=True)
         return
 
-    user["orders"].append({
-        "id": f"#{len(user['orders']) + 1:05d}",
-        "product": p["name"],
-        "price": p["price"],
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "status": "Pending"
-    })
-    p["stock"] -= 1
+    awaiting_qty[uid] = {"product_id": pid, "message_id": callback.message.message_id}
 
     await callback.message.edit_text(
-        t(uid, "order_placed", product=p["name"], price=p["price"]),
+        t(uid, "enter_qty", max=p["stock"], balance=user["balance"]),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")]
+            [InlineKeyboardButton(text=t(uid, "back_to_shop"), callback_data="shop")]
         ])
     )
+
+@dp.message(F.text)
+async def handle_text(message: types.Message):
+    uid = message.from_user.id
+
+    if uid not in awaiting_qty:
+        return
+
+    info = awaiting_qty[uid]
+    pid = info["product_id"]
+    p = products.get(pid)
+    if not p:
+        awaiting_qty.pop(uid, None)
+        return
+
+    try:
+        qty = int(message.text.strip())
+        if qty < 1 or qty > p["stock"]:
+            raise ValueError
+    except ValueError:
+        await message.reply(
+            t(uid, "invalid_qty", max=p["stock"]),
+            parse_mode="HTML"
+        )
+        return
+
+    awaiting_qty.pop(uid, None)
+
+    user = get_user(uid)
+    total = round(p["price"] * qty, 4)
+
+    if user["balance"] >= total:
+        # Pay from balance directly
+        update_balance(uid, -total)
+        order_code = generate_code("ORD")
+        add_order(uid, order_code, p["name"], total, qty, "Paid")
+        p["stock"] -= qty
+        await message.answer(
+            f"✅ <b>Order confirmed!</b>\n\n"
+            f"📦 Product: {p['name']}\n"
+            f"🔢 Quantity: {qty}\n"
+            f"💵 Total: <b>${total:.4f} USDT</b>\n"
+            f"🔖 Order code: <code>{order_code}</code>\n\n"
+            f"Your product will be delivered shortly. Contact {ADMIN} if needed.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")]
+            ])
+        )
+    else:
+        # Not enough balance — show payment screen
+        code = generate_code("BUY")
+        expires_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+        save_pending_payment(code, uid, pid, qty, total, "buy", expires_at)
+
+        text = (
+            f"{t(uid, 'waiting_payment')}\n\n"
+            f"📦 Product: <b>{p['name']}</b>\n"
+            f"🔢 Quantity: <b>{qty}</b>\n"
+            f"💵 Total: <b>${total:.4f} USDT</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔶 <b>{t(uid, 'option1_title')}</b>\n\n"
+            f"🆔 {t(uid, 'option1_binance_id')}:\n"
+            f"<code>{BINANCE_ID}</code>\n"
+            f"💵 {t(uid, 'option1_amount')}:\n"
+            f"<code>{total}</code>\n"
+            f"📝 {t(uid, 'option1_note')}:\n"
+            f"<code>{code}</code>\n\n"
+            f"{t(uid, 'option1_steps')}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔷 <b>{t(uid, 'option2_title')}</b>\n\n"
+            f"📍 {t(uid, 'option2_address')}:\n"
+            f"<code>{BEP20_ADDRESS}</code>\n"
+            f"🔗 {t(uid, 'option2_network')}\n"
+            f"💵 {t(uid, 'option2_amount')}:\n"
+            f"<code>{round(total + 0.0006, 4)}</code>\n\n"
+            f"{t(uid, 'option2_warning')}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{t(uid, 'auto_detect_buy')}"
+        )
+        await message.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=t(uid, "cancel_payment"), callback_data="main_menu")]
+            ])
+        )
 
 # ---------- PROFILE ----------
 @dp.callback_query(F.data == "profile")
@@ -657,9 +1001,9 @@ async def profile_menu(callback: types.CallbackQuery):
     text = (
         f"{t(uid, 'profile_title')}\n\n"
         f"🆔 {t(uid, 'user_id')}: <code>{uid}</code>\n"
-        f"👤 {t(uid, 'name')}: <b>{user['name']}</b>\n"
-        f"💰 {t(uid, 'balance')}: <b>${user['balance']:.2f} USDT</b>\n\n"
-        f"🔗 {t(uid, 'referral')}:\n"
+        f"👤 {t(uid, 'name_label')}: <b>{user['name']}</b>\n"
+        f"💰 {t(uid, 'balance_label')}: <b>${user['balance']:.2f} USDT</b>\n\n"
+        f"🔗 {t(uid, 'referral_label')}:\n"
         f"<code>{user['referral']}</code>\n\n"
         f"{t(uid, 'referral_desc')}"
     )
@@ -675,13 +1019,14 @@ async def profile_menu(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "history")
 async def order_history(callback: types.CallbackQuery):
     uid = callback.from_user.id
-    user = get_user(uid)
-    if not user["orders"]:
+    orders = get_orders(uid)
+    if not orders:
         text = t(uid, "no_orders")
     else:
         text = f"{t(uid, 'history_title')}\n\n"
-        for order in reversed(user["orders"][-10:]):
-            text += f"• {order['id']} | {order['product']} | ${order['price']} | {order['date']}\n"
+        for row in orders:
+            code, name, price, qty, status, created_at = row
+            text += f"• <code>{code}</code> | {name} x{qty} | ${price:.2f} | {status} | {created_at}\n"
     await callback.message.edit_text(
         text,
         parse_mode="HTML",
@@ -697,9 +1042,7 @@ async def wallet_menu(callback: types.CallbackQuery):
     user = get_user(uid)
     text = (
         f"{t(uid, 'wallet_title')}\n\n"
-        f"💵 {t(uid, 'usdt_balance')}: <b>${user['balance']:.2f}</b>\n\n"
-        f"{t(uid, 'deposit_info')}\n"
-        f"{t(uid, 'withdraw_info')}"
+        f"💵 {t(uid, 'usdt_balance')}: <b>${user['balance']:.2f}</b>"
     )
     await callback.message.edit_text(
         text,
@@ -714,11 +1057,14 @@ async def wallet_menu(callback: types.CallbackQuery):
     )
 
 @dp.callback_query(F.data == "deposit")
-async def deposit_info(callback: types.CallbackQuery):
+async def deposit_menu(callback: types.CallbackQuery):
     uid = callback.from_user.id
     get_user(uid)
+
+    # Ask for amount
+    awaiting_qty[uid] = {"product_id": "__deposit__", "message_id": callback.message.message_id}
     await callback.message.edit_text(
-        t(uid, "deposit_title") + "\n\n" + t(uid, "deposit_text"),
+        "💵 <b>DEPOSIT USDT</b>\n\nEnter the amount you want to deposit (e.g. <code>5</code> or <code>10.5</code>):",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=t(uid, "back_to_wallet"), callback_data="wallet")]
@@ -731,6 +1077,39 @@ async def withdraw_info(callback: types.CallbackQuery):
     get_user(uid)
     await callback.message.edit_text(
         t(uid, "withdraw_title") + "\n\n" + t(uid, "withdraw_text"),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=t(uid, "back_to_wallet"), callback_data="wallet")]
+        ])
+    )
+
+# Override handle_text to also handle deposit amount input
+@dp.message(F.text)
+async def handle_deposit_amount(message: types.Message):
+    uid = message.from_user.id
+    if uid not in awaiting_qty:
+        return
+    info = awaiting_qty[uid]
+    if info["product_id"] != "__deposit__":
+        return
+
+    try:
+        amount = float(message.text.strip().replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.reply("Invalid amount. Please enter a positive number, e.g. <code>5</code> or <code>10.5</code>", parse_mode="HTML")
+        return
+
+    awaiting_qty.pop(uid, None)
+    amount = round(amount, 4)
+    code = generate_code("BN")
+    expires_at = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
+    save_pending_payment(code, uid, "__deposit__", 1, amount, "deposit", expires_at)
+
+    text = build_payment_message(uid, amount, code, is_deposit=True)
+    await message.answer(
+        text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=t(uid, "back_to_wallet"), callback_data="wallet")]
@@ -770,17 +1149,19 @@ async def language_menu(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("lang_"))
 async def change_lang(callback: types.CallbackQuery):
     uid = callback.from_user.id
-    user = get_user(uid)
+    get_user(uid)
     lang = callback.data.split("_")[1]
     if lang in LANGS:
-        user["lang"] = lang
+        set_user_lang(uid, lang)
     await callback.answer(t(uid, "lang_changed"), show_alert=True)
     await callback.message.edit_text(
         t(uid, "choose_option"),
-        reply_markup=main_menu_kb(uid)
+        reply_markup=main_menu_kb(uid),
+        parse_mode="HTML"
     )
 
 # ================== RUN ==================
 if __name__ == "__main__":
+    init_db()
     print("SukoShop Bot running...")
     asyncio.run(dp.start_polling(bot))
