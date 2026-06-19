@@ -23,6 +23,12 @@ dp = Dispatcher()
 
 ADMIN = "@sukodeuva"
 ADMIN_URL = "https://t.me/sukodeuva"
+# Telegram user IDs allowed to access the admin panel.
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "7658392821").replace(" ", "").split(",") if x}
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
 BINANCE_ID = os.getenv("BINANCE_ID", "YOUR_BINANCE_ID")
 BEP20_ADDRESS = os.getenv("BEP20_ADDRESS", "YOUR_BEP20_WALLET_ADDRESS")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "SukoShopBot")
@@ -487,7 +493,7 @@ LANGS = {
         "invalid_qty": "अमान्य मात्रा। 1 और {max} के बीच संख्या दर्ज करें।",
         "insufficient_balance": "बैलेंस कम है! आपको ${needed:.2f} USDT चाहिए लेकिन है ${balance:.2f} USDT।\nपहले डिपॉजिट करें।",
         "waiting_payment": "⏳ <b>भुगतान का इंतजार...</b>",
-        "payment_expired": "भुगतान समय समाप्त। फिर कोशिश करे���।",
+        "payment_expired": "भुगतान समय समाप्त। फिर कोशिश ��रे���।",
         "deposit_info_title": "💵 <b>USDT डिपॉजिट जानकारी</b>",
         "deposit_info_amount": "राशि",
         "deposit_info_code": "कोड",
