@@ -3,6 +3,8 @@ import sqlite3
 import os
 import random
 import string
+import time
+import aiohttp
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -19,6 +21,12 @@ BINANCE_ID = os.getenv("BINANCE_ID", "YOUR_BINANCE_ID")
 BEP20_ADDRESS = os.getenv("BEP20_ADDRESS", "YOUR_BEP20_WALLET_ADDRESS")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "SukoShopBot")
 DB_PATH = "sukoshop.db"
+
+# ===== BEP20 / BscScan auto-detection =====
+BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
+# Binance-Peg BSC-USD (USDT) BEP20 contract
+USDT_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
+SCAN_INTERVAL = 30  # seconds between blockchain scans
 
 # ================== DATABASE ==================
 def init_db():
@@ -54,9 +62,26 @@ def init_db():
             amount REAL,
             payment_type TEXT,
             expires_at TEXT,
-            created_at TEXT
+            created_at TEXT,
+            expected_bep20 REAL,
+            created_epoch INTEGER
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS processed_tx (
+            tx_hash TEXT PRIMARY KEY,
+            code TEXT,
+            user_id INTEGER,
+            amount REAL,
+            processed_at TEXT
+        )
+    """)
+    # --- migrations for existing databases ---
+    for col, decl in [("expected_bep20", "REAL"), ("created_epoch", "INTEGER")]:
+        try:
+            c.execute(f"ALTER TABLE pending_payments ADD COLUMN {col} {decl}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
     conn.close()
 
@@ -109,26 +134,68 @@ def get_orders(user_id: int):
     conn.close()
     return rows
 
-def save_pending_payment(code: str, user_id: int, product_id: str, quantity: int, amount: float, payment_type: str, expires_at: str):
+def save_pending_payment(code: str, user_id: int, product_id: str, quantity: int, amount: float, payment_type: str, expires_at: str, expected_bep20: float):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO pending_payments (code, user_id, product_id, quantity, amount, payment_type, expires_at, created_at) VALUES (?,?,?,?,?,?,?,?)",
+    c.execute("""INSERT OR REPLACE INTO pending_payments
+                 (code, user_id, product_id, quantity, amount, payment_type, expires_at, created_at, expected_bep20, created_epoch)
+                 VALUES (?,?,?,?,?,?,?,?,?,?)""",
               (code, user_id, product_id, quantity, amount, payment_type, expires_at,
-               datetime.now().strftime("%Y-%m-%d %H:%M")))
+               datetime.now().strftime("%Y-%m-%d %H:%M"), expected_bep20, int(time.time())))
     conn.commit()
     conn.close()
 
 def get_pending_payment(code: str):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT * FROM pending_payments WHERE code=?", (code,))
+    c.execute("SELECT code, user_id, product_id, quantity, amount, payment_type, expires_at, expected_bep20, created_epoch FROM pending_payments WHERE code=?", (code,))
     row = c.fetchone()
     conn.close()
     if row:
         return {"code": row[0], "user_id": row[1], "product_id": row[2],
                 "quantity": row[3], "amount": row[4], "payment_type": row[5],
-                "expires_at": row[6]}
+                "expires_at": row[6], "expected_bep20": row[7], "created_epoch": row[8]}
     return None
+
+def generate_unique_bep20(base_amount: float) -> float:
+    """Generate a BEP20 amount with a unique cents tail so each payment is identifiable."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT expected_bep20 FROM pending_payments WHERE expected_bep20 IS NOT NULL")
+    used = {round(r[0], 4) for r in c.fetchall() if r[0] is not None}
+    conn.close()
+    for _ in range(300):
+        tail = random.randint(11, 999) / 10000  # 0.0011 - 0.0999
+        amt = round(base_amount + tail, 4)
+        if amt not in used:
+            return amt
+    return round(base_amount + random.randint(11, 999) / 10000, 4)
+
+def get_all_pending():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT code, user_id, product_id, quantity, amount, payment_type, expires_at, expected_bep20, created_epoch FROM pending_payments")
+    rows = c.fetchall()
+    conn.close()
+    return [{"code": r[0], "user_id": r[1], "product_id": r[2], "quantity": r[3],
+             "amount": r[4], "payment_type": r[5], "expires_at": r[6],
+             "expected_bep20": r[7], "created_epoch": r[8]} for r in rows]
+
+def is_tx_processed(tx_hash: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM processed_tx WHERE tx_hash=?", (tx_hash,))
+    row = c.fetchone()
+    conn.close()
+    return row is not None
+
+def mark_tx_processed(tx_hash: str, code: str, user_id: int, amount: float):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO processed_tx (tx_hash, code, user_id, amount, processed_at) VALUES (?,?,?,?,?)",
+              (tx_hash, code, user_id, amount, datetime.now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    conn.close()
 
 def delete_pending_payment(code: str):
     conn = sqlite3.connect(DB_PATH)
@@ -780,8 +847,7 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
         ],
     ])
 
-def build_payment_message(uid: int, amount: float, code: str, is_deposit: bool = True) -> str:
-    bep20_amount = round(amount + 0.0034, 4)
+def build_payment_message(uid: int, amount: float, code: str, bep20_amount: float, is_deposit: bool = True) -> str:
     lines = []
 
     if is_deposit:
@@ -915,6 +981,38 @@ async def handle_text(message: types.Message):
 
     info = awaiting_qty[uid]
     pid = info["product_id"]
+
+    # ----- DEPOSIT amount input -----
+    if pid == "__deposit__":
+        try:
+            amount = float(message.text.strip().replace(",", "."))
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await message.reply(
+                "Invalid amount. Please enter a positive number, e.g. <code>5</code> or <code>10.5</code>",
+                parse_mode="HTML"
+            )
+            return
+
+        awaiting_qty.pop(uid, None)
+        amount = round(amount, 4)
+        code = generate_code("BN")
+        bep20_amount = generate_unique_bep20(amount)
+        expires_at = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
+        save_pending_payment(code, uid, "__deposit__", 1, amount, "deposit", expires_at, bep20_amount)
+
+        text = build_payment_message(uid, amount, code, bep20_amount, is_deposit=True)
+        await message.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=t(uid, "back_to_wallet"), callback_data="wallet")]
+            ])
+        )
+        return
+
+    # ----- BUY quantity input -----
     p = products.get(pid)
     if not p:
         awaiting_qty.pop(uid, None)
@@ -957,8 +1055,9 @@ async def handle_text(message: types.Message):
     else:
         # Not enough balance — show payment screen
         code = generate_code("BUY")
+        bep20_amount = generate_unique_bep20(total)
         expires_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
-        save_pending_payment(code, uid, pid, qty, total, "buy", expires_at)
+        save_pending_payment(code, uid, pid, qty, total, "buy", expires_at, bep20_amount)
 
         text = (
             f"{t(uid, 'waiting_payment')}\n\n"
@@ -980,7 +1079,7 @@ async def handle_text(message: types.Message):
             f"<code>{BEP20_ADDRESS}</code>\n"
             f"🔗 {t(uid, 'option2_network')}\n"
             f"💵 {t(uid, 'option2_amount')}:\n"
-            f"<code>{round(total + 0.0006, 4)}</code>\n\n"
+            f"<code>{bep20_amount}</code>\n\n"
             f"{t(uid, 'option2_warning')}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{t(uid, 'auto_detect_buy')}"
@@ -1083,39 +1182,6 @@ async def withdraw_info(callback: types.CallbackQuery):
         ])
     )
 
-# Override handle_text to also handle deposit amount input
-@dp.message(F.text)
-async def handle_deposit_amount(message: types.Message):
-    uid = message.from_user.id
-    if uid not in awaiting_qty:
-        return
-    info = awaiting_qty[uid]
-    if info["product_id"] != "__deposit__":
-        return
-
-    try:
-        amount = float(message.text.strip().replace(",", "."))
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await message.reply("Invalid amount. Please enter a positive number, e.g. <code>5</code> or <code>10.5</code>", parse_mode="HTML")
-        return
-
-    awaiting_qty.pop(uid, None)
-    amount = round(amount, 4)
-    code = generate_code("BN")
-    expires_at = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
-    save_pending_payment(code, uid, "__deposit__", 1, amount, "deposit", expires_at)
-
-    text = build_payment_message(uid, amount, code, is_deposit=True)
-    await message.answer(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=t(uid, "back_to_wallet"), callback_data="wallet")]
-        ])
-    )
-
 # ---------- SUPPORT ----------
 @dp.callback_query(F.data == "support")
 async def support_menu(callback: types.CallbackQuery):
@@ -1160,8 +1226,142 @@ async def change_lang(callback: types.CallbackQuery):
         parse_mode="HTML"
     )
 
+# ================== BEP20 AUTO-DETECTION ==================
+async def fulfill_payment(pending: dict, tx_hash: str):
+    """Credit balance (deposit) or deliver product (buy) once a matching tx is found."""
+    uid = pending["user_id"]
+    code = pending["code"]
+    ptype = pending["payment_type"]
+
+    if ptype == "deposit":
+        update_balance(uid, pending["amount"])
+        delete_pending_payment(code)
+        user = get_user(uid)
+        try:
+            await bot.send_message(
+                uid,
+                f"✅ <b>Deposit received!</b>\n\n"
+                f"💵 Amount: <b>${pending['amount']:.2f} USDT</b>\n"
+                f"🔖 Code: <code>{code}</code>\n"
+                f"💰 New balance: <b>${user['balance']:.2f} USDT</b>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")]
+                ])
+            )
+        except Exception as e:
+            print(f"[scanner] notify deposit failed: {e}")
+
+    elif ptype == "buy":
+        pid = pending["product_id"]
+        p = products.get(pid)
+        qty = pending["quantity"]
+        name = p["name"] if p else "Product"
+        order_code = generate_code("ORD")
+        add_order(uid, order_code, name, pending["amount"], qty, "Paid")
+        if p and p["stock"] >= qty:
+            p["stock"] -= qty
+        delete_pending_payment(code)
+        try:
+            await bot.send_message(
+                uid,
+                f"✅ <b>Payment received — Order confirmed!</b>\n\n"
+                f"📦 Product: <b>{name}</b>\n"
+                f"🔢 Quantity: <b>{qty}</b>\n"
+                f"💵 Total: <b>${pending['amount']:.2f} USDT</b>\n"
+                f"🔖 Order code: <code>{order_code}</code>\n\n"
+                f"Your product will be delivered shortly. Contact {ADMIN} if needed.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")]
+                ])
+            )
+        except Exception as e:
+            print(f"[scanner] notify buy failed: {e}")
+
+
+async def check_bep20_deposits():
+    """Poll BscScan for incoming USDT (BEP20) transfers and match them to pending payments."""
+    pendings = get_all_pending()
+    if not pendings:
+        return
+
+    # Build lookup of expected amount -> pending (only those with a bep20 amount)
+    expected = {}
+    for pn in pendings:
+        if pn.get("expected_bep20") is not None:
+            expected[round(pn["expected_bep20"], 4)] = pn
+
+    if not expected:
+        return
+
+    url = (
+        "https://api.bscscan.com/api"
+        f"?module=account&action=tokentx"
+        f"&contractaddress={USDT_CONTRACT}"
+        f"&address={BEP20_ADDRESS}"
+        f"&page=1&offset=50&sort=desc"
+        f"&apikey={BSCSCAN_API_KEY}"
+    )
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                data = await resp.json()
+    except Exception as e:
+        print(f"[scanner] request failed: {e}")
+        return
+
+    if str(data.get("status")) != "1" or not isinstance(data.get("result"), list):
+        return
+
+    for tx in data["result"]:
+        try:
+            if tx.get("to", "").lower() != BEP20_ADDRESS.lower():
+                continue
+            tx_hash = tx.get("hash")
+            if not tx_hash or is_tx_processed(tx_hash):
+                continue
+
+            decimals = int(tx.get("tokenDecimal", 18))
+            value = round(int(tx["value"]) / (10 ** decimals), 4)
+            tx_epoch = int(tx.get("timeStamp", 0))
+
+            match = expected.get(value)
+            if not match:
+                continue
+            # Only accept transfers that happened after the payment was created
+            if tx_epoch and match.get("created_epoch") and tx_epoch < match["created_epoch"] - 120:
+                continue
+
+            mark_tx_processed(tx_hash, match["code"], match["user_id"], value)
+            print(f"[scanner] matched tx {tx_hash} -> {match['code']} ({value} USDT)")
+            await fulfill_payment(match, tx_hash)
+        except Exception as e:
+            print(f"[scanner] tx parse error: {e}")
+            continue
+
+
+async def scanner_loop():
+    if not BSCSCAN_API_KEY:
+        print("[scanner] BSCSCAN_API_KEY not set — BEP20 auto-detection disabled.")
+        return
+    print("[scanner] BEP20 auto-detection started.")
+    while True:
+        try:
+            await check_bep20_deposits()
+        except Exception as e:
+            print(f"[scanner] loop error: {e}")
+        await asyncio.sleep(SCAN_INTERVAL)
+
+
 # ================== RUN ==================
-if __name__ == "__main__":
+async def main():
     init_db()
     print("SukoShop Bot running...")
-    asyncio.run(dp.start_polling(bot))
+    asyncio.create_task(scanner_loop())
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
