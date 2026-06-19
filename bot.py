@@ -3,6 +3,9 @@ import os
 import random
 import string
 import time
+import hmac
+import hashlib
+import urllib.parse
 import aiohttp
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
@@ -30,6 +33,11 @@ BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
 # Binance-Peg BSC-USD (USDT) BEP20 contract
 USDT_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
 SCAN_INTERVAL = 30  # seconds between blockchain scans
+
+# ===== Binance Pay auto-detection (personal account API) =====
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+BINANCE_BASE_URL = "https://api.binance.com"
 
 # ================== DATABASE (Neon / PostgreSQL) ==================
 _pool = None
@@ -94,9 +102,11 @@ def init_db():
                 expires_at TEXT,
                 created_at TEXT,
                 expected_bep20 DOUBLE PRECISION,
+                expected_binance DOUBLE PRECISION,
                 created_epoch BIGINT
             )
         """)
+        c.execute("ALTER TABLE pending_payments ADD COLUMN IF NOT EXISTS expected_binance DOUBLE PRECISION")
         c.execute("""
             CREATE TABLE IF NOT EXISTS processed_tx (
                 tx_hash TEXT PRIMARY KEY,
@@ -143,49 +153,57 @@ def get_orders(user_id: int):
         rows = c.fetchall()
     return [(r["order_code"], r["product_name"], r["price"], r["quantity"], r["status"], r["created_at"]) for r in rows]
 
-def save_pending_payment(code: str, user_id: int, product_id: str, quantity: int, amount: float, payment_type: str, expires_at: str, expected_bep20: float):
+def save_pending_payment(code: str, user_id: int, product_id: str, quantity: int, amount: float, payment_type: str, expires_at: str, expected_bep20: float, expected_binance: float):
     with db_cursor(commit=True) as c:
         c.execute("""INSERT INTO pending_payments
-                     (code, user_id, product_id, quantity, amount, payment_type, expires_at, created_at, expected_bep20, created_epoch)
-                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     (code, user_id, product_id, quantity, amount, payment_type, expires_at, created_at, expected_bep20, expected_binance, created_epoch)
+                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                      ON CONFLICT (code) DO UPDATE SET
                        user_id=EXCLUDED.user_id, product_id=EXCLUDED.product_id,
                        quantity=EXCLUDED.quantity, amount=EXCLUDED.amount,
                        payment_type=EXCLUDED.payment_type, expires_at=EXCLUDED.expires_at,
                        created_at=EXCLUDED.created_at, expected_bep20=EXCLUDED.expected_bep20,
-                       created_epoch=EXCLUDED.created_epoch""",
+                       expected_binance=EXCLUDED.expected_binance, created_epoch=EXCLUDED.created_epoch""",
                   (code, user_id, product_id, quantity, amount, payment_type, expires_at,
-                   datetime.now().strftime("%Y-%m-%d %H:%M"), expected_bep20, int(time.time())))
+                   datetime.now().strftime("%Y-%m-%d %H:%M"), expected_bep20, expected_binance, int(time.time())))
 
 def get_pending_payment(code: str):
     with db_cursor() as c:
-        c.execute("SELECT code, user_id, product_id, quantity, amount, payment_type, expires_at, expected_bep20, created_epoch FROM pending_payments WHERE code=%s", (code,))
+        c.execute("SELECT code, user_id, product_id, quantity, amount, payment_type, expires_at, expected_bep20, expected_binance, created_epoch FROM pending_payments WHERE code=%s", (code,))
         row = c.fetchone()
     if row:
         return {"code": row["code"], "user_id": row["user_id"], "product_id": row["product_id"],
                 "quantity": row["quantity"], "amount": row["amount"], "payment_type": row["payment_type"],
-                "expires_at": row["expires_at"], "expected_bep20": row["expected_bep20"], "created_epoch": row["created_epoch"]}
+                "expires_at": row["expires_at"], "expected_bep20": row["expected_bep20"],
+                "expected_binance": row["expected_binance"], "created_epoch": row["created_epoch"]}
     return None
 
-def generate_unique_bep20(base_amount: float) -> float:
-    """Generate a BEP20 amount with a unique cents tail so each payment is identifiable."""
+def generate_unique_amount(base_amount: float, field: str) -> float:
+    """Generate an amount with a unique cents tail so each payment is identifiable by value."""
     with db_cursor() as c:
-        c.execute("SELECT expected_bep20 FROM pending_payments WHERE expected_bep20 IS NOT NULL")
-        used = {round(r["expected_bep20"], 4) for r in c.fetchall() if r["expected_bep20"] is not None}
-    for _ in range(300):
+        c.execute(f"SELECT {field} FROM pending_payments WHERE {field} IS NOT NULL")
+        used = {round(r[field], 4) for r in c.fetchall() if r[field] is not None}
+    for _ in range(500):
         tail = random.randint(11, 999) / 10000  # 0.0011 - 0.0999
         amt = round(base_amount + tail, 4)
         if amt not in used:
             return amt
     return round(base_amount + random.randint(11, 999) / 10000, 4)
 
+def generate_unique_bep20(base_amount: float) -> float:
+    return generate_unique_amount(base_amount, "expected_bep20")
+
+def generate_unique_binance(base_amount: float) -> float:
+    return generate_unique_amount(base_amount, "expected_binance")
+
 def get_all_pending():
     with db_cursor() as c:
-        c.execute("SELECT code, user_id, product_id, quantity, amount, payment_type, expires_at, expected_bep20, created_epoch FROM pending_payments")
+        c.execute("SELECT code, user_id, product_id, quantity, amount, payment_type, expires_at, expected_bep20, expected_binance, created_epoch FROM pending_payments")
         rows = c.fetchall()
     return [{"code": r["code"], "user_id": r["user_id"], "product_id": r["product_id"], "quantity": r["quantity"],
              "amount": r["amount"], "payment_type": r["payment_type"], "expires_at": r["expires_at"],
-             "expected_bep20": r["expected_bep20"], "created_epoch": r["created_epoch"]} for r in rows]
+             "expected_bep20": r["expected_bep20"], "expected_binance": r["expected_binance"],
+             "created_epoch": r["created_epoch"]} for r in rows]
 
 def is_tx_processed(tx_hash: str) -> bool:
     with db_cursor() as c:
@@ -555,7 +573,7 @@ LANGS = {
         "option2_amount": "จำนวน",
         "option2_warning": "⚠️ ส่งจำนวนนี้เท่านั้น!\n⚠️ ใช้เครือข่าย <b>BEP20</b> เท่านั้น!",
         "auto_detect": "⏱ ตรวจจับอัตโนมัติภายใน 1-2 นาที\nคุณจะได้รับแจ้งเมื่อเงินเข้า!",
-        "auto_detect_buy": "⏱ ตรวจจับอัตโนมัติภายใน 1-2 นาที\nสินค้าจะถูกส่งอัตโนมัติ!\n⏰ การชำระเงินหมดอายุใน 10 นาที",
+        "auto_detect_buy": "⏱ ตรวจจับอัตโนมัติภายใน 1-2 นาที\nสินค้าจะถูกส่งอัตโนมัติ!\n⏰ การชำระเงินหมดอายุ���น 10 นาที",
         "cancel_payment": "❌ ยกเลิก",
         "btn_shop": "🛒 ร้านค้า",
         "btn_profile": "👤 โปรไฟล์",
@@ -845,7 +863,7 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
         ],
     ])
 
-def build_payment_message(uid: int, amount: float, code: str, bep20_amount: float, is_deposit: bool = True) -> str:
+def build_payment_message(uid: int, amount: float, code: str, bep20_amount: float, binance_amount: float, is_deposit: bool = True) -> str:
     lines = []
 
     if is_deposit:
@@ -863,7 +881,7 @@ def build_payment_message(uid: int, amount: float, code: str, bep20_amount: floa
     lines.append(f"🆔 {t(uid, 'option1_binance_id')}:")
     lines.append(f"<code>{BINANCE_ID}</code>")
     lines.append(f"💵 {t(uid, 'option1_amount')}:")
-    lines.append(f"<code>{amount}</code>")
+    lines.append(f"<code>{binance_amount}</code>")
     lines.append(f"📝 {t(uid, 'option1_note')}:")
     lines.append(f"<code>{code}</code>")
     lines.append("")
@@ -997,10 +1015,11 @@ async def handle_text(message: types.Message):
         amount = round(amount, 4)
         code = generate_code("BN")
         bep20_amount = generate_unique_bep20(amount)
+        binance_amount = generate_unique_binance(amount)
         expires_at = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
-        save_pending_payment(code, uid, "__deposit__", 1, amount, "deposit", expires_at, bep20_amount)
+        save_pending_payment(code, uid, "__deposit__", 1, amount, "deposit", expires_at, bep20_amount, binance_amount)
 
-        text = build_payment_message(uid, amount, code, bep20_amount, is_deposit=True)
+        text = build_payment_message(uid, amount, code, bep20_amount, binance_amount, is_deposit=True)
         await message.answer(
             text,
             parse_mode="HTML",
@@ -1054,8 +1073,9 @@ async def handle_text(message: types.Message):
         # Not enough balance — show payment screen
         code = generate_code("BUY")
         bep20_amount = generate_unique_bep20(total)
+        binance_amount = generate_unique_binance(total)
         expires_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
-        save_pending_payment(code, uid, pid, qty, total, "buy", expires_at, bep20_amount)
+        save_pending_payment(code, uid, pid, qty, total, "buy", expires_at, bep20_amount, binance_amount)
 
         text = (
             f"{t(uid, 'waiting_payment')}\n\n"
@@ -1067,7 +1087,7 @@ async def handle_text(message: types.Message):
             f"🆔 {t(uid, 'option1_binance_id')}:\n"
             f"<code>{BINANCE_ID}</code>\n"
             f"💵 {t(uid, 'option1_amount')}:\n"
-            f"<code>{total}</code>\n"
+            f"<code>{binance_amount}</code>\n"
             f"📝 {t(uid, 'option1_note')}:\n"
             f"<code>{code}</code>\n\n"
             f"{t(uid, 'option1_steps')}\n\n"
@@ -1340,16 +1360,106 @@ async def check_bep20_deposits():
             continue
 
 
-async def scanner_loop():
-    if not BSCSCAN_API_KEY:
-        print("[scanner] BSCSCAN_API_KEY not set — BEP20 auto-detection disabled.")
+async def check_binance_pay():
+    """Poll Binance personal-account Pay history and match incoming transfers by unique amount."""
+    pendings = get_all_pending()
+    if not pendings:
         return
-    print("[scanner] BEP20 auto-detection started.")
-    while True:
+
+    # Build lookup of expected Binance Pay amount -> pending
+    expected = {}
+    for pn in pendings:
+        if pn.get("expected_binance") is not None:
+            expected[round(pn["expected_binance"], 4)] = pn
+    if not expected:
+        return
+
+    # Signed request to /sapi/v1/pay/transactions (last ~24h)
+    timestamp = int(time.time() * 1000)
+    start_time = timestamp - 24 * 60 * 60 * 1000
+    params = {
+        "startTime": start_time,
+        "endTime": timestamp,
+        "limit": 100,
+        "timestamp": timestamp,
+        "recvWindow": 60000,
+    }
+    query = urllib.parse.urlencode(params)
+    signature = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    url = f"{BINANCE_BASE_URL}/sapi/v1/pay/transactions?{query}&signature={signature}"
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                data = await resp.json()
+    except Exception as e:
+        print(f"[binance] request failed: {e}")
+        return
+
+    if not isinstance(data, dict) or str(data.get("code")) not in ("000000", "0", "None"):
+        # Binance returns code "000000" on success
+        if data.get("code") and str(data.get("code")) != "000000":
+            print(f"[binance] API error: {data}")
+            return
+
+    txs = data.get("data") or []
+    if not isinstance(txs, list):
+        return
+
+    for tx in txs:
         try:
-            await check_bep20_deposits()
+            # amount is a string; positive = income
+            amount = round(float(tx.get("amount", 0)), 4)
+            if amount <= 0:
+                continue
+            currency = (tx.get("currency") or "").upper()
+            if currency and currency != "USDT":
+                continue
+
+            tx_id = str(tx.get("transactionId") or tx.get("orderId") or "")
+            if not tx_id:
+                continue
+            uniq = f"BNPAY-{tx_id}"
+            if is_tx_processed(uniq):
+                continue
+
+            match = expected.get(amount)
+            if not match:
+                continue
+
+            tx_time = tx.get("transactionTime") or tx.get("orderTime") or 0
+            tx_epoch = int(int(tx_time) / 1000) if tx_time else 0
+            if tx_epoch and match.get("created_epoch") and tx_epoch < match["created_epoch"] - 120:
+                continue
+
+            mark_tx_processed(uniq, match["code"], match["user_id"], amount)
+            print(f"[binance] matched pay tx {tx_id} -> {match['code']} ({amount} USDT)")
+            await fulfill_payment(match, tx_id)
         except Exception as e:
-            print(f"[scanner] loop error: {e}")
+            print(f"[binance] tx parse error: {e}")
+            continue
+
+
+async def scanner_loop():
+    if not BSCSCAN_API_KEY and not (BINANCE_API_KEY and BINANCE_API_SECRET):
+        print("[scanner] No payment APIs configured — auto-detection disabled.")
+        return
+    if BSCSCAN_API_KEY:
+        print("[scanner] BEP20 auto-detection started.")
+    if BINANCE_API_KEY and BINANCE_API_SECRET:
+        print("[scanner] Binance Pay auto-detection started.")
+    while True:
+        if BSCSCAN_API_KEY:
+            try:
+                await check_bep20_deposits()
+            except Exception as e:
+                print(f"[scanner] bep20 loop error: {e}")
+        if BINANCE_API_KEY and BINANCE_API_SECRET:
+            try:
+                await check_binance_pay()
+            except Exception as e:
+                print(f"[scanner] binance loop error: {e}")
         await asyncio.sleep(SCAN_INTERVAL)
 
 
