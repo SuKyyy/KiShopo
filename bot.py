@@ -1,10 +1,13 @@
 import asyncio
-import sqlite3
 import os
 import random
 import string
 import time
 import aiohttp
+import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.extras import RealDictCursor
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -20,7 +23,7 @@ ADMIN_URL = "https://t.me/sukodeuva"
 BINANCE_ID = os.getenv("BINANCE_ID", "YOUR_BINANCE_ID")
 BEP20_ADDRESS = os.getenv("BEP20_ADDRESS", "YOUR_BEP20_WALLET_ADDRESS")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "SukoShopBot")
-DB_PATH = "sukoshop.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # ===== BEP20 / BscScan auto-detection =====
 BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
@@ -28,142 +31,147 @@ BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
 USDT_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
 SCAN_INTERVAL = 30  # seconds between blockchain scans
 
-# ================== DATABASE ==================
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            name TEXT,
-            balance REAL DEFAULT 0.0,
-            lang TEXT DEFAULT 'en',
-            referral TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            order_code TEXT,
-            product_name TEXT,
-            price REAL,
-            quantity INTEGER DEFAULT 1,
-            status TEXT DEFAULT 'Pending',
-            created_at TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS pending_payments (
-            code TEXT PRIMARY KEY,
-            user_id INTEGER,
-            product_id TEXT,
-            quantity INTEGER,
-            amount REAL,
-            payment_type TEXT,
-            expires_at TEXT,
-            created_at TEXT,
-            expected_bep20 REAL,
-            created_epoch INTEGER
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS processed_tx (
-            tx_hash TEXT PRIMARY KEY,
-            code TEXT,
-            user_id INTEGER,
-            amount REAL,
-            processed_at TEXT
-        )
-    """)
-    # --- migrations for existing databases ---
-    for col, decl in [("expected_bep20", "REAL"), ("created_epoch", "INTEGER")]:
+# ================== DATABASE (Neon / PostgreSQL) ==================
+_pool = None
+
+def get_pool():
+    global _pool
+    if _pool is None:
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL is not set")
+        _pool = ThreadedConnectionPool(1, 10, dsn=DATABASE_URL)
+    return _pool
+
+@contextmanager
+def db_cursor(commit: bool = False):
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
         try:
-            c.execute(f"ALTER TABLE pending_payments ADD COLUMN {col} {decl}")
-        except sqlite3.OperationalError:
-            pass  # column already exists
-    conn.commit()
-    conn.close()
+            yield cur
+            if commit:
+                conn.commit()
+        finally:
+            cur.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pool.putconn(conn)
+
+def init_db():
+    with db_cursor(commit=True) as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                name TEXT,
+                balance DOUBLE PRECISION DEFAULT 0.0,
+                lang TEXT DEFAULT 'en',
+                referral TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                order_code TEXT,
+                product_name TEXT,
+                price DOUBLE PRECISION,
+                quantity INTEGER DEFAULT 1,
+                status TEXT DEFAULT 'Pending',
+                created_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS pending_payments (
+                code TEXT PRIMARY KEY,
+                user_id BIGINT,
+                product_id TEXT,
+                quantity INTEGER,
+                amount DOUBLE PRECISION,
+                payment_type TEXT,
+                expires_at TEXT,
+                created_at TEXT,
+                expected_bep20 DOUBLE PRECISION,
+                created_epoch BIGINT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS processed_tx (
+                tx_hash TEXT PRIMARY KEY,
+                code TEXT,
+                user_id BIGINT,
+                amount DOUBLE PRECISION,
+                processed_at TEXT
+            )
+        """)
 
 def get_user(user_id: int, name: str = None):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    if not row:
-        referral = f"https://t.me/{BOT_USERNAME}?start={user_id}"
-        c.execute("INSERT INTO users (user_id, name, balance, lang, referral) VALUES (?,?,?,?,?)",
-                  (user_id, name or "User", 0.0, "en", referral))
-        conn.commit()
-        c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    with db_cursor(commit=True) as c:
+        c.execute("SELECT * FROM users WHERE user_id=%s", (user_id,))
         row = c.fetchone()
-    elif name and row[1] != name:
-        c.execute("UPDATE users SET name=? WHERE user_id=?", (name, user_id))
-        conn.commit()
-    conn.close()
-    return {"user_id": row[0], "name": row[1], "balance": row[2], "lang": row[3], "referral": row[4]}
+        if not row:
+            referral = f"https://t.me/{BOT_USERNAME}?start={user_id}"
+            c.execute("INSERT INTO users (user_id, name, balance, lang, referral) VALUES (%s,%s,%s,%s,%s)",
+                      (user_id, name or "User", 0.0, "en", referral))
+            c.execute("SELECT * FROM users WHERE user_id=%s", (user_id,))
+            row = c.fetchone()
+        elif name and row["name"] != name:
+            c.execute("UPDATE users SET name=%s WHERE user_id=%s", (name, user_id))
+            row["name"] = name
+    return {"user_id": row["user_id"], "name": row["name"], "balance": row["balance"],
+            "lang": row["lang"], "referral": row["referral"]}
 
 def set_user_lang(user_id: int, lang: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET lang=? WHERE user_id=?", (lang, user_id))
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True) as c:
+        c.execute("UPDATE users SET lang=%s WHERE user_id=%s", (lang, user_id))
 
 def update_balance(user_id: int, delta: float):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (delta, user_id))
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True) as c:
+        c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (delta, user_id))
 
 def add_order(user_id: int, order_code: str, product_name: str, price: float, quantity: int = 1, status: str = "Pending"):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO orders (user_id, order_code, product_name, price, quantity, status, created_at) VALUES (?,?,?,?,?,?,?)",
-              (user_id, order_code, product_name, price, quantity, status,
-               datetime.now().strftime("%Y-%m-%d %H:%M")))
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True) as c:
+        c.execute("INSERT INTO orders (user_id, order_code, product_name, price, quantity, status, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                  (user_id, order_code, product_name, price, quantity, status,
+                   datetime.now().strftime("%Y-%m-%d %H:%M")))
 
 def get_orders(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT order_code, product_name, price, quantity, status, created_at FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 10", (user_id,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    with db_cursor() as c:
+        c.execute("SELECT order_code, product_name, price, quantity, status, created_at FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 10", (user_id,))
+        rows = c.fetchall()
+    return [(r["order_code"], r["product_name"], r["price"], r["quantity"], r["status"], r["created_at"]) for r in rows]
 
 def save_pending_payment(code: str, user_id: int, product_id: str, quantity: int, amount: float, payment_type: str, expires_at: str, expected_bep20: float):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""INSERT OR REPLACE INTO pending_payments
-                 (code, user_id, product_id, quantity, amount, payment_type, expires_at, created_at, expected_bep20, created_epoch)
-                 VALUES (?,?,?,?,?,?,?,?,?,?)""",
-              (code, user_id, product_id, quantity, amount, payment_type, expires_at,
-               datetime.now().strftime("%Y-%m-%d %H:%M"), expected_bep20, int(time.time())))
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True) as c:
+        c.execute("""INSERT INTO pending_payments
+                     (code, user_id, product_id, quantity, amount, payment_type, expires_at, created_at, expected_bep20, created_epoch)
+                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     ON CONFLICT (code) DO UPDATE SET
+                       user_id=EXCLUDED.user_id, product_id=EXCLUDED.product_id,
+                       quantity=EXCLUDED.quantity, amount=EXCLUDED.amount,
+                       payment_type=EXCLUDED.payment_type, expires_at=EXCLUDED.expires_at,
+                       created_at=EXCLUDED.created_at, expected_bep20=EXCLUDED.expected_bep20,
+                       created_epoch=EXCLUDED.created_epoch""",
+                  (code, user_id, product_id, quantity, amount, payment_type, expires_at,
+                   datetime.now().strftime("%Y-%m-%d %H:%M"), expected_bep20, int(time.time())))
 
 def get_pending_payment(code: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT code, user_id, product_id, quantity, amount, payment_type, expires_at, expected_bep20, created_epoch FROM pending_payments WHERE code=?", (code,))
-    row = c.fetchone()
-    conn.close()
+    with db_cursor() as c:
+        c.execute("SELECT code, user_id, product_id, quantity, amount, payment_type, expires_at, expected_bep20, created_epoch FROM pending_payments WHERE code=%s", (code,))
+        row = c.fetchone()
     if row:
-        return {"code": row[0], "user_id": row[1], "product_id": row[2],
-                "quantity": row[3], "amount": row[4], "payment_type": row[5],
-                "expires_at": row[6], "expected_bep20": row[7], "created_epoch": row[8]}
+        return {"code": row["code"], "user_id": row["user_id"], "product_id": row["product_id"],
+                "quantity": row["quantity"], "amount": row["amount"], "payment_type": row["payment_type"],
+                "expires_at": row["expires_at"], "expected_bep20": row["expected_bep20"], "created_epoch": row["created_epoch"]}
     return None
 
 def generate_unique_bep20(base_amount: float) -> float:
     """Generate a BEP20 amount with a unique cents tail so each payment is identifiable."""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT expected_bep20 FROM pending_payments WHERE expected_bep20 IS NOT NULL")
-    used = {round(r[0], 4) for r in c.fetchall() if r[0] is not None}
-    conn.close()
+    with db_cursor() as c:
+        c.execute("SELECT expected_bep20 FROM pending_payments WHERE expected_bep20 IS NOT NULL")
+        used = {round(r["expected_bep20"], 4) for r in c.fetchall() if r["expected_bep20"] is not None}
     for _ in range(300):
         tail = random.randint(11, 999) / 10000  # 0.0011 - 0.0999
         amt = round(base_amount + tail, 4)
@@ -172,37 +180,27 @@ def generate_unique_bep20(base_amount: float) -> float:
     return round(base_amount + random.randint(11, 999) / 10000, 4)
 
 def get_all_pending():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT code, user_id, product_id, quantity, amount, payment_type, expires_at, expected_bep20, created_epoch FROM pending_payments")
-    rows = c.fetchall()
-    conn.close()
-    return [{"code": r[0], "user_id": r[1], "product_id": r[2], "quantity": r[3],
-             "amount": r[4], "payment_type": r[5], "expires_at": r[6],
-             "expected_bep20": r[7], "created_epoch": r[8]} for r in rows]
+    with db_cursor() as c:
+        c.execute("SELECT code, user_id, product_id, quantity, amount, payment_type, expires_at, expected_bep20, created_epoch FROM pending_payments")
+        rows = c.fetchall()
+    return [{"code": r["code"], "user_id": r["user_id"], "product_id": r["product_id"], "quantity": r["quantity"],
+             "amount": r["amount"], "payment_type": r["payment_type"], "expires_at": r["expires_at"],
+             "expected_bep20": r["expected_bep20"], "created_epoch": r["created_epoch"]} for r in rows]
 
 def is_tx_processed(tx_hash: str) -> bool:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM processed_tx WHERE tx_hash=?", (tx_hash,))
-    row = c.fetchone()
-    conn.close()
+    with db_cursor() as c:
+        c.execute("SELECT 1 FROM processed_tx WHERE tx_hash=%s", (tx_hash,))
+        row = c.fetchone()
     return row is not None
 
 def mark_tx_processed(tx_hash: str, code: str, user_id: int, amount: float):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO processed_tx (tx_hash, code, user_id, amount, processed_at) VALUES (?,?,?,?,?)",
-              (tx_hash, code, user_id, amount, datetime.now().strftime("%Y-%m-%d %H:%M")))
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True) as c:
+        c.execute("INSERT INTO processed_tx (tx_hash, code, user_id, amount, processed_at) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (tx_hash) DO NOTHING",
+                  (tx_hash, code, user_id, amount, datetime.now().strftime("%Y-%m-%d %H:%M")))
 
 def delete_pending_payment(code: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM pending_payments WHERE code=?", (code,))
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True) as c:
+        c.execute("DELETE FROM pending_payments WHERE code=%s", (code,))
 
 def generate_code(prefix: str = "BN") -> str:
     ts = datetime.now().strftime("%y%m%d%H%M%S")
