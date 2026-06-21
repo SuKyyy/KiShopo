@@ -133,7 +133,31 @@ def init_db():
                 description TEXT DEFAULT '',
                 category TEXT DEFAULT '',
                 sort_order INTEGER DEFAULT 0,
-                active BOOLEAN DEFAULT TRUE
+                active BOOLEAN DEFAULT TRUE,
+                delivery_type TEXT DEFAULT 'manual',
+                manual_msg TEXT DEFAULT ''
+            )
+        """)
+        # Migrations for pre-existing products tables
+        c.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS delivery_type TEXT DEFAULT 'manual'")
+        c.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS manual_msg TEXT DEFAULT ''")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS stock_items (
+                id SERIAL PRIMARY KEY,
+                product_id TEXT,
+                content TEXT,
+                used BOOLEAN DEFAULT FALSE,
+                used_by BIGINT,
+                used_at TEXT
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_stock_items_pid ON stock_items (product_id, used)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS translations (
+                src_hash TEXT,
+                target_lang TEXT,
+                translated TEXT,
+                PRIMARY KEY (src_hash, target_lang)
             )
         """)
         c.execute("""
@@ -262,8 +286,10 @@ def seed_products_if_empty():
                        p["description"], p["category"], i))
     print("[db] seeded products table")
 
+PRODUCT_COLS = "id, name, price, stock, emoji, description, category, sort_order, active, delivery_type, manual_msg"
+
 def get_all_products(active_only: bool = False):
-    q = "SELECT id, name, price, stock, emoji, description, category, sort_order, active FROM products"
+    q = f"SELECT {PRODUCT_COLS} FROM products"
     if active_only:
         q += " WHERE active=TRUE"
     q += " ORDER BY sort_order ASC, id ASC"
@@ -274,7 +300,7 @@ def get_all_products(active_only: bool = False):
 
 def get_product(pid: str):
     with db_cursor() as c:
-        c.execute("SELECT id, name, price, stock, emoji, description, category, sort_order, active FROM products WHERE id=%s", (pid,))
+        c.execute(f"SELECT {PRODUCT_COLS} FROM products WHERE id=%s", (pid,))
         row = c.fetchone()
     return dict(row) if row else None
 
@@ -288,18 +314,19 @@ def next_product_id() -> str:
         n = max(nums) + 1
     return str(n)
 
-def create_product(name: str, price: float, stock: int, emoji: str, description: str, category: str) -> str:
+def create_product(name: str, price: float, stock: int, emoji: str, description: str, category: str,
+                   delivery_type: str = "manual") -> str:
     pid = next_product_id()
     with db_cursor(commit=True) as c:
         c.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 AS so FROM products")
         so = c.fetchone()["so"]
-        c.execute("""INSERT INTO products (id, name, price, stock, emoji, description, category, sort_order, active)
-                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE)""",
-                  (pid, name, price, stock, emoji, description, category, so))
+        c.execute("""INSERT INTO products (id, name, price, stock, emoji, description, category, sort_order, active, delivery_type, manual_msg)
+                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,'')""",
+                  (pid, name, price, stock, emoji, description, category, so, delivery_type))
     return pid
 
 def update_product_field(pid: str, field: str, value):
-    allowed = {"name", "price", "stock", "emoji", "description", "category", "active"}
+    allowed = {"name", "price", "stock", "emoji", "description", "category", "active", "delivery_type", "manual_msg"}
     if field not in allowed:
         raise ValueError(f"invalid field {field}")
     with db_cursor(commit=True) as c:
@@ -307,11 +334,47 @@ def update_product_field(pid: str, field: str, value):
 
 def delete_product(pid: str):
     with db_cursor(commit=True) as c:
+        c.execute("DELETE FROM stock_items WHERE product_id=%s", (pid,))
         c.execute("DELETE FROM products WHERE id=%s", (pid,))
 
 def decrement_stock(pid: str, qty: int):
     with db_cursor(commit=True) as c:
         c.execute("UPDATE products SET stock = GREATEST(stock - %s, 0) WHERE id=%s", (qty, pid))
+
+# ----- Auto-delivery stock items -----
+def count_available_items(pid: str) -> int:
+    with db_cursor() as c:
+        c.execute("SELECT COUNT(*) AS n FROM stock_items WHERE product_id=%s AND used=FALSE", (pid,))
+        return c.fetchone()["n"]
+
+def sync_auto_stock(pid: str):
+    """For auto products, the stock column mirrors the number of unused items."""
+    n = count_available_items(pid)
+    with db_cursor(commit=True) as c:
+        c.execute("UPDATE products SET stock=%s WHERE id=%s", (n, pid))
+    return n
+
+def add_stock_items(pid: str, items: list):
+    with db_cursor(commit=True) as c:
+        for content in items:
+            c.execute("INSERT INTO stock_items (product_id, content, used) VALUES (%s,%s,FALSE)",
+                      (pid, content))
+    return sync_auto_stock(pid)
+
+def pop_stock_items(pid: str, qty: int):
+    """Atomically claim up to `qty` unused items. Returns list of contents delivered."""
+    delivered = []
+    with db_cursor(commit=True) as c:
+        c.execute("""SELECT id, content FROM stock_items
+                     WHERE product_id=%s AND used=FALSE
+                     ORDER BY id ASC LIMIT %s FOR UPDATE""", (pid, qty))
+        rows = c.fetchall()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        for r in rows:
+            c.execute("UPDATE stock_items SET used=TRUE, used_at=%s WHERE id=%s", (now, r["id"]))
+            delivered.append(r["content"])
+    sync_auto_stock(pid)
+    return delivered
 
 def get_categories():
     """Return ordered list of distinct non-empty categories."""
@@ -333,6 +396,50 @@ def set_setting(key: str, value: str):
     with db_cursor(commit=True) as c:
         c.execute("""INSERT INTO app_settings (key, value) VALUES (%s,%s)
                      ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""", (key, value))
+
+# ----- Auto translation (Google translate free endpoint, with DB cache) -----
+def _cache_get_translation(src_hash: str, target_lang: str):
+    with db_cursor() as c:
+        c.execute("SELECT translated FROM translations WHERE src_hash=%s AND target_lang=%s",
+                  (src_hash, target_lang))
+        row = c.fetchone()
+    return row["translated"] if row else None
+
+def _cache_put_translation(src_hash: str, target_lang: str, translated: str):
+    with db_cursor(commit=True) as c:
+        c.execute("""INSERT INTO translations (src_hash, target_lang, translated) VALUES (%s,%s,%s)
+                     ON CONFLICT (src_hash, target_lang) DO UPDATE SET translated=EXCLUDED.translated""",
+                  (src_hash, target_lang, translated))
+
+async def translate_text(text: str, target_lang: str) -> str:
+    """Translate `text` to target_lang. Caches results in the DB.
+    Falls back to the original text if translation fails."""
+    if not text or not text.strip():
+        return text
+    target_lang = (target_lang or "en").split("-")[0]
+    src_hash = hashlib.sha256(f"{target_lang}:{text}".encode("utf-8")).hexdigest()
+    cached = _cache_get_translation(src_hash, target_lang)
+    if cached is not None:
+        return cached
+    url = (
+        "https://translate.googleapis.com/translate_a/single"
+        f"?client=gtx&sl=auto&tl={target_lang}&dt=t&q={urllib.parse.quote(text)}"
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    return text
+                data = await resp.json(content_type=None)
+        # data[0] is a list of [translated_segment, original_segment, ...]
+        translated = "".join(seg[0] for seg in data[0] if seg and seg[0])
+        if not translated.strip():
+            return text
+        _cache_put_translation(src_hash, target_lang, translated)
+        return translated
+    except Exception as e:
+        print(f"[translate] failed ({target_lang}): {e}")
+        return text
 
 # ----- Admin helpers -----
 def get_all_user_ids():
@@ -434,6 +541,17 @@ LANGS = {
         "btn_wallet": "💰 Wallet",
         "btn_support": "🛟 Support",
         "btn_language": "🌐 Language",
+        "order_confirmed_title": "Order confirmed!",
+        "product_label": "Product",
+        "qty_label": "Quantity",
+        "total_label": "Total",
+        "order_code_label": "Order code",
+        "your_items": "Your items:",
+        "partial_delivery": "Only part of your order was in stock. The remaining {missing} will be delivered manually by {admin}.",
+        "await_manual": "Your items are being prepared. Please contact {admin} to receive them.",
+        "contact_seller": "💬 Contact seller",
+        "manual_instructions": "To receive your product, contact the seller {admin} and send the message below:",
+        "copy_message": "Copy and send this message:",
     },
     "pt": {
         "welcome": (
@@ -505,6 +623,17 @@ LANGS = {
         "btn_wallet": "💰 Carteira",
         "btn_support": "🛟 Suporte",
         "btn_language": "🌐 Idioma",
+        "order_confirmed_title": "Pedido confirmado!",
+        "product_label": "Produto",
+        "qty_label": "Quantidade",
+        "total_label": "Total",
+        "order_code_label": "Código do pedido",
+        "your_items": "Seus itens:",
+        "partial_delivery": "Apenas parte do seu pedido tinha estoque. Os {missing} restantes serão entregues manualmente por {admin}.",
+        "await_manual": "Seus itens estão sendo preparados. Entre em contato com {admin} para recebê-los.",
+        "contact_seller": "💬 Falar com o vendedor",
+        "manual_instructions": "Para receber seu produto, fale com o vendedor {admin} e envie a mensagem abaixo:",
+        "copy_message": "Copie e envie esta mensagem:",
     },
     "id": {
         "welcome": (
@@ -632,7 +761,7 @@ LANGS = {
         "option1_binance_id": "Binance ID",
         "option1_amount": "राशि",
         "option1_note": "नोट",
-        "option1_steps": "B. Binance → Pay → Send → ऊपर ID पेस्ट करें\n⚠️ नोट बिल्कुल सही होना चाहिए!",
+        "option1_steps": "B. Binance → Pay → Send → ऊ���र ID पेस्ट करें\n⚠️ नोट बिल्कुल सही होना चाहिए!",
         "option2_title": "🔷 विकल्प 2: वॉलेट ट्रांसफर (BEP20)",
         "option2_address": "पता",
         "option2_network": "नेटवर्क: <b>BEP20</b>",
@@ -972,13 +1101,17 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="🛠 Admin Panel", callback_data="admin")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def product_detail_text(uid: int, p: dict) -> str:
-    """Build the product detail message dynamically from DB fields."""
+async def product_detail_text(uid: int, p: dict) -> str:
+    """Build the product detail message dynamically from DB fields.
+    The description is auto-translated to the user's language."""
     if p["stock"] > 0:
         stock_line = f"📦 {t(uid, 'in_stock')}: {p['stock']}"
     else:
         stock_line = f"📦 {t(uid, 'out_of_stock')}"
     body = (p.get("description") or "").strip()
+    if body:
+        lang = get_user(uid).get("lang", "en")
+        body = await translate_text(body, lang)
     lines = [
         f"{p['emoji']} <b>{p['name']}</b>",
         "",
@@ -987,8 +1120,70 @@ def product_detail_text(uid: int, p: dict) -> str:
     ]
     if body:
         lines.append("")
-        lines.append(body)
+        lines.append(html.escape(body))
     return "\n".join(lines)
+
+def build_manual_message(p: dict, qty: int, order_code: str) -> str:
+    """Pre-filled message the buyer copies and sends to the seller's DM."""
+    template = (p.get("manual_msg") or "").strip()
+    if template:
+        try:
+            return template.format(product=p["name"], qty=qty, code=order_code, price=p["price"])
+        except Exception:
+            return template
+    return (
+        f"Olá! Acabei de comprar: {p['name']} (x{qty}).\n"
+        f"Pedido: {order_code}.\n"
+        f"Aguardo a entrega, obrigado!"
+    )
+
+async def deliver_product(uid: int, p: dict, qty: int, order_code: str, total: float):
+    """Deliver a purchased product to the buyer based on its delivery type."""
+    pid = p["id"]
+    header = (
+        f"✅ <b>{t(uid, 'order_confirmed_title')}</b>\n\n"
+        f"📦 {t(uid, 'product_label')}: <b>{html.escape(p['name'])}</b>\n"
+        f"🔢 {t(uid, 'qty_label')}: <b>{qty}</b>\n"
+        f"💵 {t(uid, 'total_label')}: <b>${total:.2f} USDT</b>\n"
+        f"🔖 {t(uid, 'order_code_label')}: <code>{order_code}</code>"
+    )
+
+    if p.get("delivery_type") == "auto":
+        items = pop_stock_items(pid, qty)
+        if items:
+            body = "\n".join(f"<code>{html.escape(it)}</code>" for it in items)
+            text = f"{header}\n\n🎁 <b>{t(uid, 'your_items')}</b>\n{body}"
+            if len(items) < qty:
+                # Not enough stock — deliver what we have, escalate the rest
+                missing = qty - len(items)
+                text += f"\n\n⚠️ {t(uid, 'partial_delivery', missing=missing, admin=ADMIN)}"
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")]
+            ])
+            await bot.send_message(uid, text, parse_mode="HTML", reply_markup=kb)
+            return
+        # No items available at all -> fall through to manual escalation
+        text = f"{header}\n\n⏳ {t(uid, 'await_manual', admin=ADMIN)}"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=t(uid, "contact_seller"), url=ADMIN_URL)],
+            [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")],
+        ])
+        await bot.send_message(uid, text, parse_mode="HTML", reply_markup=kb)
+        return
+
+    # Manual delivery
+    prefilled = build_manual_message(p, qty, order_code)
+    text = (
+        f"{header}\n\n"
+        f"🤝 {t(uid, 'manual_instructions', admin=ADMIN)}\n\n"
+        f"📋 {t(uid, 'copy_message')}\n"
+        f"<code>{html.escape(prefilled)}</code>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t(uid, "contact_seller"), url=ADMIN_URL)],
+        [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")],
+    ])
+    await bot.send_message(uid, text, parse_mode="HTML", reply_markup=kb)
 
 def build_payment_message(uid: int, amount: float, code: str, bep20_amount: float, binance_amount: float, is_deposit: bool = True) -> str:
     lines = []
@@ -1118,8 +1313,9 @@ async def show_product(callback: types.CallbackQuery):
     if p["stock"] > 0:
         kb.append([InlineKeyboardButton(text=t(uid, "buy_now"), callback_data=f"buy_{pid}")])
     kb.append([InlineKeyboardButton(text=t(uid, "back_to_shop"), callback_data="shop")])
+    detail = await product_detail_text(uid, p)
     await callback.message.edit_text(
-        product_detail_text(uid, p),
+        detail,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
         parse_mode="HTML"
     )
@@ -1217,19 +1413,10 @@ async def handle_text(message: types.Message):
         update_balance(uid, -total)
         order_code = generate_code("ORD")
         add_order(uid, order_code, p["name"], total, qty, "Paid")
-        decrement_stock(pid, qty)
-        await message.answer(
-            f"✅ <b>Order confirmed!</b>\n\n"
-            f"📦 Product: {p['name']}\n"
-            f"🔢 Quantity: {qty}\n"
-            f"💵 Total: <b>${total:.4f} USDT</b>\n"
-            f"🔖 Order code: <code>{order_code}</code>\n\n"
-            f"Your product will be delivered shortly. Contact {ADMIN} if needed.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")]
-            ])
-        )
+        # Auto products manage stock via the item pool; manual decrements the counter.
+        if p.get("delivery_type") != "auto":
+            decrement_stock(pid, qty)
+        await deliver_product(uid, p, qty, order_code, total)
     else:
         # Not enough balance — show payment screen
         code = generate_code("BUY")
@@ -1470,27 +1657,46 @@ async def admin_products(callback: types.CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML"
     )
 
-def admin_product_kb(pid: str, active: bool) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def admin_product_kb(p: dict) -> InlineKeyboardMarkup:
+    pid = p["id"]
+    is_auto = p.get("delivery_type") == "auto"
+    rows = [
         [
             InlineKeyboardButton(text="✏️ Nome", callback_data=f"admin_edit_name_{pid}"),
             InlineKeyboardButton(text="💵 Preço", callback_data=f"admin_edit_price_{pid}"),
         ],
-        [
+    ]
+    # Stock row: auto products manage stock via the item pool
+    if is_auto:
+        rows.append([
+            InlineKeyboardButton(text="📥 Itens (estoque)", callback_data=f"admin_items_{pid}"),
+            InlineKeyboardButton(text="😀 Emoji", callback_data=f"admin_edit_emoji_{pid}"),
+        ])
+    else:
+        rows.append([
             InlineKeyboardButton(text="📦 Estoque", callback_data=f"admin_edit_stock_{pid}"),
             InlineKeyboardButton(text="😀 Emoji", callback_data=f"admin_edit_emoji_{pid}"),
-        ],
-        [
-            InlineKeyboardButton(text="🗂 Categoria", callback_data=f"admin_edit_category_{pid}"),
-            InlineKeyboardButton(text="📝 Descrição", callback_data=f"admin_edit_description_{pid}"),
-        ],
-        [InlineKeyboardButton(
-            text="🚫 Desativar" if active else "✅ Ativar",
-            callback_data=f"admin_toggle_{pid}"
-        )],
-        [InlineKeyboardButton(text="🗑 Remover", callback_data=f"admin_del_{pid}")],
-        [InlineKeyboardButton(text="⬅️ Voltar", callback_data="admin_products")],
+        ])
+    rows.append([
+        InlineKeyboardButton(text="🗂 Categoria", callback_data=f"admin_edit_category_{pid}"),
+        InlineKeyboardButton(text="📝 Descrição", callback_data=f"admin_edit_description_{pid}"),
     ])
+    # Delivery type toggle
+    rows.append([InlineKeyboardButton(
+        text=("🚚 Entrega: AUTOMÁTICA ▸ trocar p/ manual" if is_auto
+              else "🚚 Entrega: MANUAL ▸ trocar p/ automática"),
+        callback_data=f"admin_delivery_{pid}"
+    )])
+    if not is_auto:
+        rows.append([InlineKeyboardButton(text="✉️ Mensagem de entrega (manual)",
+                                          callback_data=f"admin_edit_manualmsg_{pid}")])
+    rows.append([InlineKeyboardButton(
+        text="🚫 Desativar" if p["active"] else "✅ Ativar",
+        callback_data=f"admin_toggle_{pid}"
+    )])
+    rows.append([InlineKeyboardButton(text="🗑 Remover", callback_data=f"admin_del_{pid}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Voltar", callback_data="admin_products")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def render_admin_product(target, pid: str, edit: bool):
     p = get_product(pid)
@@ -1501,17 +1707,26 @@ async def render_admin_product(target, pid: str, edit: bool):
             await target.answer("Produto não encontrado.", reply_markup=admin_main_kb())
         return
     body = html.escape(p.get("description") or "")
+    is_auto = p.get("delivery_type") == "auto"
+    if is_auto:
+        avail = count_available_items(pid)
+        stock_line = f"📦 Itens disponíveis: <b>{avail}</b>"
+        delivery_line = "🚚 Entrega: <b>AUTOMÁTICA</b> (entrega itens do estoque)"
+    else:
+        stock_line = f"📦 Estoque: <b>{p['stock']}</b>"
+        delivery_line = "🚚 Entrega: <b>MANUAL</b> (cliente fala no seu privado)"
     text = (
         f"📦 <b>{html.escape(p['name'])}</b>\n\n"
         f"🆔 ID: <code>{p['id']}</code>\n"
         f"{p['emoji']} Emoji\n"
         f"💵 Preço: <b>${p['price']:.2f}</b>\n"
-        f"📦 Estoque: <b>{p['stock']}</b>\n"
+        f"{stock_line}\n"
         f"🗂 Categoria: <b>{html.escape(p.get('category') or '—')}</b>\n"
+        f"{delivery_line}\n"
         f"{'🟢 Ativo' if p['active'] else '⚪️ Inativo'}\n\n"
         f"📝 Descrição:\n{body or '—'}"
     )
-    kb = admin_product_kb(pid, p["active"])
+    kb = admin_product_kb(p)
     if edit:
         await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     else:
@@ -1568,6 +1783,70 @@ async def admin_delete_yes(callback: types.CallbackQuery):
     await callback.answer("Produto removido.", show_alert=True)
     await admin_products(callback)
 
+@dp.callback_query(F.data.startswith("admin_delivery_"))
+async def admin_toggle_delivery(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    pid = callback.data[len("admin_delivery_"):]
+    p = get_product(pid)
+    if not p:
+        await callback.answer("Produto não encontrado.", show_alert=True)
+        return
+    new_type = "manual" if p.get("delivery_type") == "auto" else "auto"
+    update_product_field(pid, "delivery_type", new_type)
+    if new_type == "auto":
+        # When switching to auto, stock mirrors the item pool
+        sync_auto_stock(pid)
+        await callback.answer("Entrega automática ativada. Adicione itens ao estoque.", show_alert=True)
+    else:
+        await callback.answer("Entrega manual ativada.", show_alert=True)
+    await render_admin_product(callback, pid, edit=True)
+
+@dp.callback_query(F.data.startswith("admin_items_"))
+async def admin_items(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    pid = callback.data[len("admin_items_"):]
+    p = get_product(pid)
+    if not p:
+        await callback.answer("Produto não encontrado.", show_alert=True)
+        return
+    avail = count_available_items(pid)
+    await callback.message.edit_text(
+        f"📥 <b>ESTOQUE DE ITENS</b>\n\n"
+        f"Produto: <b>{html.escape(p['name'])}</b>\n"
+        f"Itens disponíveis: <b>{avail}</b>\n\n"
+        f"Cada linha que você enviar vira 1 item entregue automaticamente "
+        f"(ex: um login:senha, um código, um link). Toque em adicionar para enviar vários de uma vez.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Adicionar itens", callback_data=f"admin_additems_{pid}")],
+            [InlineKeyboardButton(text="⬅️ Voltar", callback_data=f"admin_prod_{pid}")],
+        ])
+    )
+
+@dp.callback_query(F.data.startswith("admin_additems_"))
+async def admin_add_items(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    pid = callback.data[len("admin_additems_"):]
+    admin_state[uid] = {"action": "add_items", "pid": pid}
+    await callback.message.edit_text(
+        "📥 Envie os itens — <b>um por linha</b>.\n\n"
+        "Cada linha será 1 unidade entregue automaticamente após o pagamento.\n"
+        "Ex:\n<code>email1@x.com:senha123\nemail2@x.com:senha456</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancelar", callback_data=f"admin_items_{pid}")]
+        ])
+    )
+
 EDIT_FIELD_PROMPTS = {
     "name": "✏️ Envie o novo <b>nome</b> do produto:",
     "price": "💵 Envie o novo <b>preço</b> (ex: <code>9.99</code>):",
@@ -1575,7 +1854,16 @@ EDIT_FIELD_PROMPTS = {
     "emoji": "😀 Envie o novo <b>emoji</b> do produto:",
     "category": "🗂 Envie a nova <b>categoria</b> (ou <code>-</code> para nenhuma):",
     "description": "📝 Envie a nova <b>descrição</b> (pode ter várias linhas):",
+    "manualmsg": (
+        "✉️ Envie a <b>mensagem de entrega manual</b> que o cliente vai copiar e te mandar.\n\n"
+        "Você pode usar estas variáveis:\n"
+        "<code>{product}</code> nome · <code>{qty}</code> quantidade · <code>{code}</code> pedido · <code>{price}</code> preço\n\n"
+        "Envie <code>-</code> para usar a mensagem padrão."
+    ),
 }
+
+# Maps callback field tokens to actual DB columns
+FIELD_DB_MAP = {"manualmsg": "manual_msg"}
 
 @dp.callback_query(F.data.startswith("admin_edit_"))
 async def admin_edit_field(callback: types.CallbackQuery):
@@ -1736,14 +2024,36 @@ async def handle_admin_text(message: types.Message) -> bool:
                     raise ValueError
             elif field == "category":
                 value = "" if txt == "-" else txt
+            elif field == "manualmsg":
+                value = "" if txt == "-" else message.text
+            elif field == "description":
+                value = message.text
             else:
                 value = txt
         except ValueError:
             await message.reply("Valor inválido. Tente novamente.")
             return True
-        update_product_field(pid, field, value)
+        db_field = FIELD_DB_MAP.get(field, field)
+        update_product_field(pid, db_field, value)
         admin_state.pop(uid, None)
         await message.answer("✅ Atualizado!")
+        await render_admin_product(message, pid, edit=False)
+        return True
+
+    # ----- Add auto-delivery stock items (one per line) -----
+    if action == "add_items":
+        pid = st["pid"]
+        if not get_product(pid):
+            admin_state.pop(uid, None)
+            await message.answer("Produto não encontrado.", reply_markup=admin_main_kb())
+            return True
+        items = [line.strip() for line in message.text.splitlines() if line.strip()]
+        if not items:
+            await message.reply("Nenhum item válido. Envie pelo menos uma linha.")
+            return True
+        total = add_stock_items(pid, items)
+        admin_state.pop(uid, None)
+        await message.answer(f"✅ {len(items)} item(ns) adicionado(s)!\n📦 Total disponível agora: {total}")
         await render_admin_product(message, pid, edit=False)
         return True
 
@@ -1883,23 +2193,23 @@ async def fulfill_payment(pending: dict, tx_hash: str):
         name = p["name"] if p else "Product"
         order_code = generate_code("ORD")
         add_order(uid, order_code, name, pending["amount"], qty, "Paid")
-        if p:
+        if p and p.get("delivery_type") != "auto":
             decrement_stock(pid, qty)
         delete_pending_payment(code)
         try:
-            await bot.send_message(
-                uid,
-                f"✅ <b>Payment received — Order confirmed!</b>\n\n"
-                f"📦 Product: <b>{name}</b>\n"
-                f"🔢 Quantity: <b>{qty}</b>\n"
-                f"💵 Total: <b>${pending['amount']:.2f} USDT</b>\n"
-                f"🔖 Order code: <code>{order_code}</code>\n\n"
-                f"Your product will be delivered shortly. Contact {ADMIN} if needed.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")]
-                ])
-            )
+            if p:
+                await deliver_product(uid, p, qty, order_code, pending["amount"])
+            else:
+                await bot.send_message(
+                    uid,
+                    f"✅ <b>Payment received — Order confirmed!</b>\n\n"
+                    f"🔖 Order code: <code>{order_code}</code>\n\n"
+                    f"Contact {ADMIN} to receive your product.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")]
+                    ])
+                )
         except Exception as e:
             print(f"[scanner] notify buy failed: {e}")
 
