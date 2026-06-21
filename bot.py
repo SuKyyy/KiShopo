@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramConflictError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -1470,18 +1471,40 @@ async def scanner_loop():
 
 
 # ================== RUN ==================
+async def run_polling_supervised():
+    """
+    Keep polling alive across Render redeploys.
+
+    During a deploy the new instance can start before the old one is fully
+    killed, so both poll the same token for a few seconds and Telegram raises
+    TelegramConflictError. Instead of crashing/looping noisily, we wait for the
+    old instance to die and retry. Once we're the only instance, polling runs
+    normally and this loop never spins.
+    """
+    attempt = 0
+    while True:
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            attempt = 0  # reset once we successfully (re)claim the connection
+            await dp.start_polling(bot, drop_pending_updates=True, handle_signals=False)
+            # start_polling returns only on a clean shutdown
+            break
+        except TelegramConflictError:
+            attempt += 1
+            wait = min(10 + attempt * 5, 60)  # back off up to 60s
+            print(f"[polling] another instance still active (deploy overlap?), "
+                  f"retrying in {wait}s (attempt {attempt})")
+            await asyncio.sleep(wait)
+        except Exception as e:
+            print(f"[polling] unexpected error: {e}; retrying in 15s")
+            await asyncio.sleep(15)
+
+
 async def main():
     init_db()
     print("SukoShop Bot running...")
-    # Clear any lingering webhook and drop old queued updates to avoid
-    # "terminated by other getUpdates request" conflicts on redeploy.
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        print(f"[startup] delete_webhook warning: {e}")
     asyncio.create_task(scanner_loop())
-    # allow_updates reset + drop pending updates also helps recover from conflicts
-    await dp.start_polling(bot, drop_pending_updates=True)
+    await run_polling_supervised()
 
 
 if __name__ == "__main__":
