@@ -5,6 +5,7 @@ import string
 import time
 import hmac
 import hashlib
+import html
 import urllib.parse
 import aiohttp
 import psycopg2
@@ -123,6 +124,26 @@ def init_db():
                 processed_at TEXT
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                price DOUBLE PRECISION NOT NULL DEFAULT 0,
+                stock INTEGER NOT NULL DEFAULT 0,
+                emoji TEXT DEFAULT '📦',
+                description TEXT DEFAULT '',
+                category TEXT DEFAULT '',
+                sort_order INTEGER DEFAULT 0,
+                active BOOLEAN DEFAULT TRUE
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+    seed_products_if_empty()
 
 def get_user(user_id: int, name: str = None):
     with db_cursor(commit=True) as c:
@@ -226,6 +247,116 @@ def mark_tx_processed(tx_hash: str, code: str, user_id: int, amount: float):
 def delete_pending_payment(code: str):
     with db_cursor(commit=True) as c:
         c.execute("DELETE FROM pending_payments WHERE code=%s", (code,))
+
+# ----- Products (Neon-backed) -----
+def seed_products_if_empty():
+    """Populate the products table from SEED_PRODUCTS the first time only."""
+    with db_cursor(commit=True) as c:
+        c.execute("SELECT COUNT(*) AS n FROM products")
+        if c.fetchone()["n"] > 0:
+            return
+        for i, p in enumerate(SEED_PRODUCTS):
+            c.execute("""INSERT INTO products (id, name, price, stock, emoji, description, category, sort_order, active)
+                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE)
+                         ON CONFLICT (id) DO NOTHING""",
+                      (p["id"], p["name"], p["price"], p["stock"], p["emoji"],
+                       p["description"], p["category"], i))
+    print("[db] seeded products table")
+
+def get_all_products(active_only: bool = False):
+    q = "SELECT id, name, price, stock, emoji, description, category, sort_order, active FROM products"
+    if active_only:
+        q += " WHERE active=TRUE"
+    q += " ORDER BY sort_order ASC, id ASC"
+    with db_cursor() as c:
+        c.execute(q)
+        rows = c.fetchall()
+    return [dict(r) for r in rows]
+
+def get_product(pid: str):
+    with db_cursor() as c:
+        c.execute("SELECT id, name, price, stock, emoji, description, category, sort_order, active FROM products WHERE id=%s", (pid,))
+        row = c.fetchone()
+    return dict(row) if row else None
+
+def next_product_id() -> str:
+    with db_cursor() as c:
+        c.execute("SELECT id FROM products")
+        ids = [r["id"] for r in c.fetchall()]
+    n = 1
+    nums = [int(i) for i in ids if i.isdigit()]
+    if nums:
+        n = max(nums) + 1
+    return str(n)
+
+def create_product(name: str, price: float, stock: int, emoji: str, description: str, category: str) -> str:
+    pid = next_product_id()
+    with db_cursor(commit=True) as c:
+        c.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 AS so FROM products")
+        so = c.fetchone()["so"]
+        c.execute("""INSERT INTO products (id, name, price, stock, emoji, description, category, sort_order, active)
+                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE)""",
+                  (pid, name, price, stock, emoji, description, category, so))
+    return pid
+
+def update_product_field(pid: str, field: str, value):
+    allowed = {"name", "price", "stock", "emoji", "description", "category", "active"}
+    if field not in allowed:
+        raise ValueError(f"invalid field {field}")
+    with db_cursor(commit=True) as c:
+        c.execute(f"UPDATE products SET {field}=%s WHERE id=%s", (value, pid))
+
+def delete_product(pid: str):
+    with db_cursor(commit=True) as c:
+        c.execute("DELETE FROM products WHERE id=%s", (pid,))
+
+def decrement_stock(pid: str, qty: int):
+    with db_cursor(commit=True) as c:
+        c.execute("UPDATE products SET stock = GREATEST(stock - %s, 0) WHERE id=%s", (qty, pid))
+
+def get_categories():
+    """Return ordered list of distinct non-empty categories."""
+    with db_cursor() as c:
+        c.execute("""SELECT category, MIN(sort_order) AS so FROM products
+                     WHERE active=TRUE AND COALESCE(category,'') <> ''
+                     GROUP BY category ORDER BY so ASC""")
+        rows = c.fetchall()
+    return [r["category"] for r in rows]
+
+# ----- App settings (key/value) -----
+def get_setting(key: str, default: str = "") -> str:
+    with db_cursor() as c:
+        c.execute("SELECT value FROM app_settings WHERE key=%s", (key,))
+        row = c.fetchone()
+    return row["value"] if row and row["value"] is not None else default
+
+def set_setting(key: str, value: str):
+    with db_cursor(commit=True) as c:
+        c.execute("""INSERT INTO app_settings (key, value) VALUES (%s,%s)
+                     ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""", (key, value))
+
+# ----- Admin helpers -----
+def get_all_user_ids():
+    with db_cursor() as c:
+        c.execute("SELECT user_id FROM users")
+        rows = c.fetchall()
+    return [r["user_id"] for r in rows]
+
+def get_stats():
+    with db_cursor() as c:
+        c.execute("SELECT COUNT(*) AS n, COALESCE(SUM(balance),0) AS bal FROM users")
+        u = c.fetchone()
+        c.execute("SELECT COUNT(*) AS n, COALESCE(SUM(price*quantity),0) AS rev FROM orders WHERE status='Paid'")
+        o = c.fetchone()
+        c.execute("SELECT COUNT(*) AS n FROM products WHERE active=TRUE")
+        p = c.fetchone()
+        c.execute("SELECT COUNT(*) AS n FROM pending_payments")
+        pend = c.fetchone()
+    return {
+        "users": u["n"], "balance_total": float(u["bal"]),
+        "paid_orders": o["n"], "revenue": float(o["rev"]),
+        "active_products": p["n"], "pending": pend["n"],
+    }
 
 def generate_code(prefix: str = "BN") -> str:
     ts = datetime.now().strftime("%y%m%d%H%M%S")
@@ -734,16 +865,13 @@ LANGS = {
 }
 
 # ================== PRODUCTS ==================
-products = {
-    "1": {
-        "name": "Grok Super 3M (FW)",
-        "price": 12.0,
-        "stock": 39,
-        "emoji": "🤖",
-        "desc": (
-            "🤖 <b>Grok Super — 3 Month (Family Warranty)</b>\n\n"
-            "💵 Price: <b>$12.00 USDT</b>\n"
-            "📦 In stock: 39\n\n"
+# Seed data — only used to populate the Neon `products` table on first run.
+# After that, products live in the database and are managed via the admin panel.
+SEED_PRODUCTS = [
+    {
+        "id": "1", "name": "Grok Super 3M (FW)", "price": 12.0, "stock": 39,
+        "emoji": "🤖", "category": "AI Assistants",
+        "description": (
             "✅ Full warranty 3 months\n"
             "✅ Works on any account\n"
             "✅ No credit card needed\n"
@@ -751,15 +879,10 @@ products = {
             "✅ Instant delivery after payment"
         ),
     },
-    "2": {
-        "name": "Grok Super 6M (FW)",
-        "price": 19.0,
-        "stock": 3,
-        "emoji": "🤖",
-        "desc": (
-            "🤖 <b>Grok Super — 6 Month (Family Warranty)</b>\n\n"
-            "💵 Price: <b>$19.00 USDT</b>\n"
-            "📦 In stock: 3\n\n"
+    {
+        "id": "2", "name": "Grok Super 6M (FW)", "price": 19.0, "stock": 3,
+        "emoji": "🤖", "category": "AI Assistants",
+        "description": (
             "✅ Full warranty 6 months\n"
             "✅ Works on any account\n"
             "✅ No credit card needed\n"
@@ -767,15 +890,10 @@ products = {
             "✅ Instant delivery after payment"
         ),
     },
-    "3": {
-        "name": "Gemini Pro 18M",
-        "price": 1.5,
-        "stock": 53,
-        "emoji": "✨",
-        "desc": (
-            "✨ <b>Gemini Pro Link — 18 Months</b>\n\n"
-            "💵 Price: <b>$1.50 USDT</b>\n"
-            "📦 In stock: 53\n\n"
+    {
+        "id": "3", "name": "Gemini Pro 18M", "price": 1.5, "stock": 53,
+        "emoji": "✨", "category": "AI Assistants",
+        "description": (
             "✅ 24 hours holding warranty\n"
             "✅ Click on the link and confirm\n"
             "✅ No credit card needed\n"
@@ -784,15 +902,10 @@ products = {
             "✅ Instant delivery after payment"
         ),
     },
-    "4": {
-        "name": "Capcut Pro Team 1M (FW)",
-        "price": 2.5,
-        "stock": 30,
-        "emoji": "🎬",
-        "desc": (
-            "🎬 <b>Capcut Pro Team — 1 Month Full Date (Family Warranty)</b>\n\n"
-            "💵 Price: <b>$2.50 USDT</b>\n"
-            "📦 In stock: 30\n\n"
+    {
+        "id": "4", "name": "Capcut Pro Team 1M (FW)", "price": 2.5, "stock": 30,
+        "emoji": "🎬", "category": "Creative",
+        "description": (
             "✅ Full Date warranty\n"
             "✅ Works on all devices\n"
             "✅ No credit card needed\n"
@@ -800,53 +913,40 @@ products = {
             "✅ Instant delivery after payment"
         ),
     },
-    "5": {
-        "name": "ChatGPT Plus 1M (NW)",
-        "price": 2.0,
-        "stock": 0,
-        "emoji": "💬",
-        "desc": (
-            "💬 <b>ChatGPT Plus Shared — 1 Month (No Warranty)</b>\n\n"
-            "💵 Price: <b>$2.00 USDT</b>\n"
-            "📦 Out of stock\n\n"
+    {
+        "id": "5", "name": "ChatGPT Plus 1M (NW)", "price": 2.0, "stock": 0,
+        "emoji": "💬", "category": "AI Assistants",
+        "description": (
             "• High quality shared account\n"
             "• Instant delivery after payment\n"
             "• No warranty — sold as is"
         ),
     },
-    "6": {
-        "name": "Adobe Creative Cloud 1M (NW)",
-        "price": 0.5,
-        "stock": 0,
-        "emoji": "🎨",
-        "desc": (
-            "🎨 <b>Adobe Creative Cloud — 1 Month (No Warranty)</b>\n\n"
-            "💵 Price: <b>$0.50 USDT</b>\n"
-            "📦 Out of stock\n\n"
+    {
+        "id": "6", "name": "Adobe Creative Cloud 1M (NW)", "price": 0.5, "stock": 0,
+        "emoji": "🎨", "category": "Creative",
+        "description": (
             "• Full Creative Cloud access\n"
             "• All Adobe apps included\n"
             "• No warranty — sold as is"
         ),
     },
-    "7": {
-        "name": "ElevenLabs 3M (FW)",
-        "price": 15.0,
-        "stock": 0,
-        "emoji": "🎙️",
-        "desc": (
-            "🎙️ <b>ElevenLabs — 3 Month (Family Warranty)</b>\n\n"
-            "💵 Price: <b>$15.00 USDT</b>\n"
-            "📦 Out of stock\n\n"
+    {
+        "id": "7", "name": "ElevenLabs 3M (FW)", "price": 15.0, "stock": 0,
+        "emoji": "🎙️", "category": "AI Tools",
+        "description": (
             "✅ Premium voice AI access\n"
             "✅ Full warranty 3 months\n"
             "✅ No credit card needed\n"
             "✅ Instant delivery after payment"
         ),
     },
-}
+]
 
 # Tracks users waiting to type qty: {user_id: {"product_id": str, "message_id": int}}
 awaiting_qty = {}
+# Tracks admin multi-step flows: {user_id: {"action": str, "step": str, "data": {...}}}
+admin_state = {}
 
 # ================== HELPERS ==================
 def t(user_id: int, key: str, **kwargs) -> str:
@@ -857,7 +957,7 @@ def t(user_id: int, key: str, **kwargs) -> str:
     return text.format(admin=ADMIN, admin_url=ADMIN_URL, **kwargs)
 
 def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text=t(user_id, "btn_shop"), callback_data="shop")],
         [
             InlineKeyboardButton(text=t(user_id, "btn_profile"), callback_data="profile"),
@@ -868,7 +968,28 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=t(user_id, "btn_support"), callback_data="support"),
             InlineKeyboardButton(text=t(user_id, "btn_language"), callback_data="language"),
         ],
-    ])
+    ]
+    if is_admin(user_id):
+        rows.append([InlineKeyboardButton(text="🛠 Admin Panel", callback_data="admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def product_detail_text(uid: int, p: dict) -> str:
+    """Build the product detail message dynamically from DB fields."""
+    if p["stock"] > 0:
+        stock_line = f"📦 {t(uid, 'in_stock')}: {p['stock']}"
+    else:
+        stock_line = f"📦 {t(uid, 'out_of_stock')}"
+    body = (p.get("description") or "").strip()
+    lines = [
+        f"{p['emoji']} <b>{p['name']}</b>",
+        "",
+        f"💵 {t(uid, 'deposit_info_amount')}: <b>${p['price']:.2f} USDT</b>",
+        stock_line,
+    ]
+    if body:
+        lines.append("")
+        lines.append(body)
+    return "\n".join(lines)
 
 def build_payment_message(uid: int, amount: float, code: str, bep20_amount: float, binance_amount: float, is_deposit: bool = True) -> str:
     lines = []
@@ -940,13 +1061,39 @@ async def back_to_main(callback: types.CallbackQuery):
 async def shop_menu(callback: types.CallbackQuery):
     uid = callback.from_user.id
     get_user(uid)
+    all_products = get_all_products(active_only=True)
     kb = []
-    for pid, p in products.items():
-        if p["stock"] > 0:
-            label = f"{p['emoji']} {p['name']} — ${p['price']} ({t(uid, 'in_stock')} {p['stock']})"
+    # Group by category (uncategorized products go under "Other" at the end)
+    categories = get_categories()
+    grouped = {cat: [] for cat in categories}
+    other = []
+    for p in all_products:
+        cat = (p.get("category") or "").strip()
+        if cat in grouped:
+            grouped[cat].append(p)
         else:
-            label = f"🔴 {p['name']} — ${p['price']} ({t(uid, 'out_of_stock')})"
-        kb.append([InlineKeyboardButton(text=label, callback_data=f"product_{pid}")])
+            other.append(p)
+
+    def add_product_button(p):
+        if p["stock"] > 0:
+            label = f"{p['emoji']} {p['name']} — ${p['price']:.2f} ({t(uid, 'in_stock')} {p['stock']})"
+        else:
+            label = f"🔴 {p['name']} — ${p['price']:.2f} ({t(uid, 'out_of_stock')})"
+        kb.append([InlineKeyboardButton(text=label, callback_data=f"product_{p['id']}")])
+
+    for cat in categories:
+        if grouped[cat]:
+            kb.append([InlineKeyboardButton(text=f"📂 {cat}", callback_data="noop")])
+            for p in grouped[cat]:
+                add_product_button(p)
+    if other:
+        if categories:
+            kb.append([InlineKeyboardButton(text="📂 Other", callback_data="noop")])
+        for p in other:
+            add_product_button(p)
+
+    if not all_products:
+        kb.append([InlineKeyboardButton(text="— empty —", callback_data="noop")])
     kb.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="shop")])
     kb.append([InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")])
     await callback.message.edit_text(
@@ -955,12 +1102,16 @@ async def shop_menu(callback: types.CallbackQuery):
         parse_mode="HTML"
     )
 
+@dp.callback_query(F.data == "noop")
+async def noop_handler(callback: types.CallbackQuery):
+    await callback.answer()
+
 @dp.callback_query(F.data.startswith("product_"))
 async def show_product(callback: types.CallbackQuery):
     uid = callback.from_user.id
     get_user(uid)
-    pid = callback.data.split("_")[1]
-    p = products.get(pid)
+    pid = callback.data.split("_", 1)[1]
+    p = get_product(pid)
     if not p:
         await callback.answer("Product not found.", show_alert=True)
         return
@@ -969,7 +1120,7 @@ async def show_product(callback: types.CallbackQuery):
         kb.append([InlineKeyboardButton(text=t(uid, "buy_now"), callback_data=f"buy_{pid}")])
     kb.append([InlineKeyboardButton(text=t(uid, "back_to_shop"), callback_data="shop")])
     await callback.message.edit_text(
-        p["desc"],
+        product_detail_text(uid, p),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
         parse_mode="HTML"
     )
@@ -977,8 +1128,8 @@ async def show_product(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("buy_"))
 async def buy_product(callback: types.CallbackQuery):
     uid = callback.from_user.id
-    pid = callback.data.split("_")[1]
-    p = products.get(pid)
+    pid = callback.data.split("_", 1)[1]
+    p = get_product(pid)
     user = get_user(uid)
 
     if not p or p["stock"] <= 0:
@@ -998,6 +1149,10 @@ async def buy_product(callback: types.CallbackQuery):
 @dp.message(F.text)
 async def handle_text(message: types.Message):
     uid = message.from_user.id
+
+    # Admin multi-step flows take priority
+    if await handle_admin_text(message):
+        return
 
     if uid not in awaiting_qty:
         return
@@ -1037,7 +1192,7 @@ async def handle_text(message: types.Message):
         return
 
     # ----- BUY quantity input -----
-    p = products.get(pid)
+    p = get_product(pid)
     if not p:
         awaiting_qty.pop(uid, None)
         return
@@ -1063,7 +1218,7 @@ async def handle_text(message: types.Message):
         update_balance(uid, -total)
         order_code = generate_code("ORD")
         add_order(uid, order_code, p["name"], total, qty, "Paid")
-        p["stock"] -= qty
+        decrement_stock(pid, qty)
         await message.answer(
             f"✅ <b>Order confirmed!</b>\n\n"
             f"📦 Product: {p['name']}\n"
@@ -1098,7 +1253,7 @@ async def handle_text(message: types.Message):
             f"📝 {t(uid, 'option1_note')}:\n"
             f"<code>{code}</code>\n\n"
             f"{t(uid, 'option1_steps')}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━��━━━━\n"
             f"🔷 <b>{t(uid, 'option2_title')}</b>\n\n"
             f"📍 {t(uid, 'option2_address')}:\n"
             f"<code>{BEP20_ADDRESS}</code>\n"
@@ -1251,6 +1406,451 @@ async def change_lang(callback: types.CallbackQuery):
         parse_mode="HTML"
     )
 
+# ================== ADMIN PANEL ==================
+def admin_main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 Produtos", callback_data="admin_products")],
+        [InlineKeyboardButton(text="📢 Aviso para todos", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="💰 Ajustar saldo", callback_data="admin_balance")],
+        [InlineKeyboardButton(text="📊 Estatísticas", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="⬅️ Voltar ao menu", callback_data="main_menu")],
+    ])
+
+ADMIN_HOME_TEXT = (
+    "🛠 <b>PAINEL ADMIN</b>\n\n"
+    "Gerencie sua loja por aqui:\n"
+    "• 📦 Produtos — adicionar, editar (nome, preço, estoque, descrição, categoria) e remover\n"
+    "• 📢 Aviso — enviar mensagem para todos os usuários\n"
+    "• 💰 Saldo — creditar/debitar saldo de um usuário\n"
+    "• 📊 Estatísticas — visão geral da loja\n\n"
+    "Escolha uma opção:"
+)
+
+async def show_admin_home(message_or_cb, edit: bool):
+    if edit:
+        await message_or_cb.message.edit_text(ADMIN_HOME_TEXT, reply_markup=admin_main_kb(), parse_mode="HTML")
+    else:
+        await message_or_cb.answer(ADMIN_HOME_TEXT, reply_markup=admin_main_kb(), parse_mode="HTML")
+
+@dp.message(Command("admin"))
+async def admin_cmd(message: types.Message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return
+    admin_state.pop(uid, None)
+    await show_admin_home(message, edit=False)
+
+@dp.callback_query(F.data == "admin")
+async def admin_home(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    admin_state.pop(uid, None)
+    await show_admin_home(callback, edit=True)
+
+# ---------- ADMIN: PRODUCTS ----------
+@dp.callback_query(F.data == "admin_products")
+async def admin_products(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    admin_state.pop(uid, None)
+    prods = get_all_products()
+    kb = [[InlineKeyboardButton(text="➕ Adicionar produto", callback_data="admin_addprod")]]
+    for p in prods:
+        status = "🟢" if p["active"] and p["stock"] > 0 else ("🟡" if p["active"] else "⚪️")
+        kb.append([InlineKeyboardButton(
+            text=f"{status} {p['emoji']} {p['name']} — ${p['price']:.2f} (x{p['stock']})",
+            callback_data=f"admin_prod_{p['id']}"
+        )])
+    kb.append([InlineKeyboardButton(text="⬅️ Voltar", callback_data="admin")])
+    await callback.message.edit_text(
+        "📦 <b>PRODUTOS</b>\n\n🟢 ativo c/ estoque · 🟡 ativo s/ estoque · ⚪️ inativo\n\nSelecione um produto para editar:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML"
+    )
+
+def admin_product_kb(pid: str, active: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✏️ Nome", callback_data=f"admin_edit_name_{pid}"),
+            InlineKeyboardButton(text="💵 Preço", callback_data=f"admin_edit_price_{pid}"),
+        ],
+        [
+            InlineKeyboardButton(text="📦 Estoque", callback_data=f"admin_edit_stock_{pid}"),
+            InlineKeyboardButton(text="😀 Emoji", callback_data=f"admin_edit_emoji_{pid}"),
+        ],
+        [
+            InlineKeyboardButton(text="🗂 Categoria", callback_data=f"admin_edit_category_{pid}"),
+            InlineKeyboardButton(text="📝 Descrição", callback_data=f"admin_edit_description_{pid}"),
+        ],
+        [InlineKeyboardButton(
+            text="🚫 Desativar" if active else "✅ Ativar",
+            callback_data=f"admin_toggle_{pid}"
+        )],
+        [InlineKeyboardButton(text="🗑 Remover", callback_data=f"admin_del_{pid}")],
+        [InlineKeyboardButton(text="⬅️ Voltar", callback_data="admin_products")],
+    ])
+
+async def render_admin_product(target, pid: str, edit: bool):
+    p = get_product(pid)
+    if not p:
+        if edit:
+            await target.message.edit_text("Produto não encontrado.", reply_markup=admin_main_kb())
+        else:
+            await target.answer("Produto não encontrado.", reply_markup=admin_main_kb())
+        return
+    body = html.escape(p.get("description") or "")
+    text = (
+        f"📦 <b>{html.escape(p['name'])}</b>\n\n"
+        f"🆔 ID: <code>{p['id']}</code>\n"
+        f"{p['emoji']} Emoji\n"
+        f"💵 Preço: <b>${p['price']:.2f}</b>\n"
+        f"📦 Estoque: <b>{p['stock']}</b>\n"
+        f"🗂 Categoria: <b>{html.escape(p.get('category') or '—')}</b>\n"
+        f"{'🟢 Ativo' if p['active'] else '⚪️ Inativo'}\n\n"
+        f"📝 Descrição:\n{body or '—'}"
+    )
+    kb = admin_product_kb(pid, p["active"])
+    if edit:
+        await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("admin_prod_"))
+async def admin_product_view(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    admin_state.pop(uid, None)
+    pid = callback.data[len("admin_prod_"):]
+    await render_admin_product(callback, pid, edit=True)
+
+@dp.callback_query(F.data.startswith("admin_toggle_"))
+async def admin_toggle_product(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    pid = callback.data[len("admin_toggle_"):]
+    p = get_product(pid)
+    if p:
+        update_product_field(pid, "active", not p["active"])
+    await render_admin_product(callback, pid, edit=True)
+
+@dp.callback_query(F.data.startswith("admin_del_"))
+async def admin_delete_confirm(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    pid = callback.data[len("admin_del_"):]
+    p = get_product(pid)
+    name = html.escape(p["name"]) if p else pid
+    await callback.message.edit_text(
+        f"🗑 Remover <b>{name}</b>?\n\nIsto não pode ser desfeito.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Sim, remover", callback_data=f"admin_delyes_{pid}")],
+            [InlineKeyboardButton(text="❌ Cancelar", callback_data=f"admin_prod_{pid}")],
+        ])
+    )
+
+@dp.callback_query(F.data.startswith("admin_delyes_"))
+async def admin_delete_yes(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    pid = callback.data[len("admin_delyes_"):]
+    delete_product(pid)
+    await callback.answer("Produto removido.", show_alert=True)
+    await admin_products(callback)
+
+EDIT_FIELD_PROMPTS = {
+    "name": "✏️ Envie o novo <b>nome</b> do produto:",
+    "price": "💵 Envie o novo <b>preço</b> (ex: <code>9.99</code>):",
+    "stock": "📦 Envie o novo <b>estoque</b> (número inteiro):",
+    "emoji": "😀 Envie o novo <b>emoji</b> do produto:",
+    "category": "🗂 Envie a nova <b>categoria</b> (ou <code>-</code> para nenhuma):",
+    "description": "📝 Envie a nova <b>descrição</b> (pode ter várias linhas):",
+}
+
+@dp.callback_query(F.data.startswith("admin_edit_"))
+async def admin_edit_field(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    rest = callback.data[len("admin_edit_"):]
+    field, pid = rest.split("_", 1)
+    if field not in EDIT_FIELD_PROMPTS:
+        await callback.answer("Campo inválido.", show_alert=True)
+        return
+    admin_state[uid] = {"action": "edit_field", "field": field, "pid": pid}
+    await callback.message.edit_text(
+        EDIT_FIELD_PROMPTS[field],
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancelar", callback_data=f"admin_prod_{pid}")]
+        ])
+    )
+
+# ---------- ADMIN: ADD PRODUCT ----------
+ADD_STEPS = ["name", "price", "stock", "emoji", "category", "description"]
+ADD_PROMPTS = {
+    "name": "➕ <b>Novo produto</b>\n\nEnvie o <b>nome</b>:",
+    "price": "💵 Envie o <b>preço</b> (ex: <code>9.99</code>):",
+    "stock": "📦 Envie o <b>estoque</b> inicial (número inteiro):",
+    "emoji": "😀 Envie um <b>emoji</b> (ou <code>-</code> para 📦):",
+    "category": "🗂 Envie a <b>categoria</b> (ou <code>-</code> para nenhuma):",
+    "description": "📝 Envie a <b>descrição</b> (ou <code>-</code> para vazia):",
+}
+
+@dp.callback_query(F.data == "admin_addprod")
+async def admin_add_product(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    admin_state[uid] = {"action": "add", "step": "name", "data": {}}
+    await callback.message.edit_text(
+        ADD_PROMPTS["name"], parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancelar", callback_data="admin_products")]
+        ])
+    )
+
+# ---------- ADMIN: BROADCAST ----------
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    admin_state[uid] = {"action": "broadcast"}
+    await callback.message.edit_text(
+        "📢 <b>AVISO PARA TODOS</b>\n\nEnvie a mensagem que será enviada a todos os usuários.\n"
+        "Você poderá confirmar antes do envio.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancelar", callback_data="admin")]
+        ])
+    )
+
+@dp.callback_query(F.data == "admin_bcast_send")
+async def admin_broadcast_send(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    st = admin_state.get(uid)
+    if not st or st.get("action") != "broadcast" or not st.get("text"):
+        await callback.answer("Nada para enviar.", show_alert=True)
+        await show_admin_home(callback, edit=True)
+        return
+    text = st["text"]
+    admin_state.pop(uid, None)
+    await callback.message.edit_text("📡 Enviando aviso...", parse_mode="HTML")
+    user_ids = get_all_user_ids()
+    sent, failed = 0, 0
+    for target_id in user_ids:
+        try:
+            await bot.send_message(target_id, text, parse_mode="HTML")
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # stay under Telegram rate limits
+    await callback.message.answer(
+        f"✅ <b>Aviso enviado!</b>\n\n📨 Entregue: {sent}\n⚠️ Falhou: {failed}",
+        parse_mode="HTML", reply_markup=admin_main_kb()
+    )
+
+# ---------- ADMIN: ADJUST BALANCE ----------
+@dp.callback_query(F.data == "admin_balance")
+async def admin_balance_start(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    admin_state[uid] = {"action": "balance", "step": "uid", "data": {}}
+    await callback.message.edit_text(
+        "💰 <b>AJUSTAR SALDO</b>\n\nEnvie o <b>ID do usuário</b> (número do Telegram):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancelar", callback_data="admin")]
+        ])
+    )
+
+# ---------- ADMIN: STATS ----------
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    s = get_stats()
+    text = (
+        "📊 <b>ESTATÍSTICAS</b>\n\n"
+        f"👥 Usuários: <b>{s['users']}</b>\n"
+        f"💰 Saldo total em circulação: <b>${s['balance_total']:.2f} USDT</b>\n"
+        f"✅ Pedidos pagos: <b>{s['paid_orders']}</b>\n"
+        f"💵 Receita (pagos): <b>${s['revenue']:.2f} USDT</b>\n"
+        f"📦 Produtos ativos: <b>{s['active_products']}</b>\n"
+        f"⏳ Pagamentos pendentes: <b>{s['pending']}</b>"
+    )
+    await callback.message.edit_text(
+        text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Atualizar", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="⬅️ Voltar", callback_data="admin")],
+        ])
+    )
+
+async def handle_admin_text(message: types.Message) -> bool:
+    """Process admin multi-step text input. Returns True if it consumed the message."""
+    uid = message.from_user.id
+    if not is_admin(uid) or uid not in admin_state:
+        return False
+
+    st = admin_state[uid]
+    action = st.get("action")
+    txt = message.text.strip()
+
+    # ----- Edit single product field -----
+    if action == "edit_field":
+        field, pid = st["field"], st["pid"]
+        if not get_product(pid):
+            admin_state.pop(uid, None)
+            await message.answer("Produto não encontrado.", reply_markup=admin_main_kb())
+            return True
+        try:
+            if field == "price":
+                value = round(float(txt.replace(",", ".")), 2)
+                if value < 0:
+                    raise ValueError
+            elif field == "stock":
+                value = int(txt)
+                if value < 0:
+                    raise ValueError
+            elif field == "category":
+                value = "" if txt == "-" else txt
+            else:
+                value = txt
+        except ValueError:
+            await message.reply("Valor inválido. Tente novamente.")
+            return True
+        update_product_field(pid, field, value)
+        admin_state.pop(uid, None)
+        await message.answer("✅ Atualizado!")
+        await render_admin_product(message, pid, edit=False)
+        return True
+
+    # ----- Add product flow -----
+    if action == "add":
+        step = st["step"]
+        data = st["data"]
+        try:
+            if step == "price":
+                data["price"] = round(float(txt.replace(",", ".")), 2)
+                if data["price"] < 0:
+                    raise ValueError
+            elif step == "stock":
+                data["stock"] = int(txt)
+                if data["stock"] < 0:
+                    raise ValueError
+            elif step == "emoji":
+                data["emoji"] = "📦" if txt == "-" else txt
+            elif step == "category":
+                data["category"] = "" if txt == "-" else txt
+            elif step == "description":
+                data["description"] = "" if txt == "-" else message.text
+            else:  # name
+                data["name"] = txt
+        except ValueError:
+            await message.reply("Valor inválido. Tente novamente.")
+            return True
+
+        idx = ADD_STEPS.index(step)
+        if idx + 1 < len(ADD_STEPS):
+            next_step = ADD_STEPS[idx + 1]
+            st["step"] = next_step
+            await message.answer(ADD_PROMPTS[next_step], parse_mode="HTML")
+        else:
+            pid = create_product(
+                data["name"], data["price"], data["stock"],
+                data.get("emoji", "📦"), data.get("description", ""), data.get("category", "")
+            )
+            admin_state.pop(uid, None)
+            await message.answer(f"✅ Produto criado! (ID {pid})")
+            await render_admin_product(message, pid, edit=False)
+        return True
+
+    # ----- Broadcast: capture text, then confirm -----
+    if action == "broadcast":
+        st["text"] = message.html_text if message.html_text else message.text
+        preview = st["text"]
+        await message.answer(
+            f"📢 <b>Pré-visualização do aviso:</b>\n\n{preview}\n\n"
+            f"Enviar para <b>{len(get_all_user_ids())}</b> usuários?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Enviar agora", callback_data="admin_bcast_send")],
+                [InlineKeyboardButton(text="❌ Cancelar", callback_data="admin")],
+            ])
+        )
+        return True
+
+    # ----- Adjust balance flow -----
+    if action == "balance":
+        step = st["step"]
+        if step == "uid":
+            try:
+                target = int(txt)
+            except ValueError:
+                await message.reply("ID inválido. Envie apenas números.")
+                return True
+            st["data"]["target"] = target
+            st["step"] = "amount"
+            await message.answer(
+                "💵 Envie o valor a ajustar. Use positivo para creditar ou negativo para debitar.\n"
+                "Ex: <code>10</code> ou <code>-5.5</code>",
+                parse_mode="HTML"
+            )
+            return True
+        elif step == "amount":
+            try:
+                delta = round(float(txt.replace(",", ".")), 4)
+            except ValueError:
+                await message.reply("Valor inválido. Tente novamente.")
+                return True
+            target = st["data"]["target"]
+            get_user(target)  # ensure the user row exists
+            update_balance(target, delta)
+            new_bal = get_user(target)["balance"]
+            admin_state.pop(uid, None)
+            await message.answer(
+                f"✅ Saldo ajustado!\n\n👤 Usuário: <code>{target}</code>\n"
+                f"➕ Ajuste: <b>{delta:+.2f} USDT</b>\n💰 Novo saldo: <b>${new_bal:.2f} USDT</b>",
+                parse_mode="HTML", reply_markup=admin_main_kb()
+            )
+            # Notify the user about the balance change
+            try:
+                if delta != 0:
+                    await bot.send_message(
+                        target,
+                        f"💰 Seu saldo foi {'creditado' if delta > 0 else 'ajustado'}: "
+                        f"<b>{delta:+.2f} USDT</b>\nNovo saldo: <b>${new_bal:.2f} USDT</b>",
+                        parse_mode="HTML"
+                    )
+            except Exception:
+                pass
+            return True
+
+    return False
+
 # ================== BEP20 AUTO-DETECTION ==================
 async def fulfill_payment(pending: dict, tx_hash: str):
     """Credit balance (deposit) or deliver product (buy) once a matching tx is found."""
@@ -1279,13 +1879,13 @@ async def fulfill_payment(pending: dict, tx_hash: str):
 
     elif ptype == "buy":
         pid = pending["product_id"]
-        p = products.get(pid)
+        p = get_product(pid)
         qty = pending["quantity"]
         name = p["name"] if p else "Product"
         order_code = generate_code("ORD")
         add_order(uid, order_code, name, pending["amount"], qty, "Paid")
-        if p and p["stock"] >= qty:
-            p["stock"] -= qty
+        if p:
+            decrement_stock(pid, qty)
         delete_pending_payment(code)
         try:
             await bot.send_message(
