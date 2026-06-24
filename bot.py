@@ -26,9 +26,46 @@ ADMIN = "@sukodeuva"
 ADMIN_URL = "https://t.me/sukodeuva"
 # Telegram user IDs allowed to access the admin panel.
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "7658392821").replace(" ", "").split(",") if x}
+# Admins identified by @username. Their numeric IDs are captured automatically
+# the first time they interact with the bot (and persisted in the DB).
+ADMIN_USERNAMES = {
+    u.strip().lower().lstrip("@")
+    for u in os.getenv("ADMIN_USERNAMES", "KiritoShopS2").split(",") if u.strip()
+}
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+def load_extra_admins():
+    """Load admin IDs (resolved from usernames earlier) saved in the DB."""
+    try:
+        raw = get_setting("extra_admin_ids", "")
+    except Exception:
+        return
+    for x in raw.replace(" ", "").split(","):
+        if x.isdigit():
+            ADMIN_IDS.add(int(x))
+
+def register_admin_id(user_id: int):
+    """Promote a user to admin and persist it so it survives restarts."""
+    if user_id in ADMIN_IDS:
+        return
+    ADMIN_IDS.add(user_id)
+    try:
+        raw = get_setting("extra_admin_ids", "")
+        ids = {x for x in raw.replace(" ", "").split(",") if x}
+        ids.add(str(user_id))
+        set_setting("extra_admin_ids", ",".join(sorted(ids)))
+    except Exception as e:
+        print(f"[admin] persist extra admin failed: {e}")
+
+def maybe_register_admin(user) -> None:
+    """If this user's @username is in ADMIN_USERNAMES, grant them admin."""
+    if user is None:
+        return
+    uname = (getattr(user, "username", "") or "").lower()
+    if uname and uname in ADMIN_USERNAMES:
+        register_admin_id(user.id)
 
 BINANCE_ID = os.getenv("BINANCE_ID", "YOUR_BINANCE_ID")
 BEP20_ADDRESS = os.getenv("BEP20_ADDRESS", "YOUR_BEP20_WALLET_ADDRESS")
@@ -716,6 +753,7 @@ LANGS = {
         ),
         "pix_scan_send": "Send the QR image or the PIX code now:",
         "pix_not_recognized": "❌ Couldn't read a valid PIX there. Send a clear QR image or the copy-and-paste code.",
+        "pix_sent_neutral": "📨 Your PIX was sent for manual processing.",
         "pix_insufficient": "❌ Insufficient balance. Each scan costs ${price:.2f}. Your balance: ${balance:.2f}. Please deposit first.",
         "pix_pending": (
             "✅ <b>PIX received!</b>\n\n{info}\n\n"
@@ -820,6 +858,7 @@ LANGS = {
         ),
         "pix_scan_send": "Envie a imagem do QR ou o código PIX agora:",
         "pix_not_recognized": "❌ Não consegui ler um PIX válido aí. Envie uma imagem nítida do QR ou o código copia e cola.",
+        "pix_sent_neutral": "📨 Seu PIX foi enviado para processamento manual.",
         "pix_insufficient": "❌ Saldo insuficiente. Cada leitura custa ${price:.2f}. Seu saldo: ${balance:.2f}. Faça um depósito primeiro.",
         "pix_pending": (
             "✅ <b>PIX recebido!</b>\n\n{info}\n\n"
@@ -1063,7 +1102,7 @@ LANGS = {
         "in_stock": "有库存",
         "out_of_stock": "缺货",
         "back": "⬅️ 返回",
-        "back_to_shop": "⬅️ 返回商店",
+        "back_to_shop": "��️ 返回商店",
         "back_to_wallet": "⬅️ 返回钱包",
         "buy_now": "💳 立即购买",
         "profile_title": "👤 <b>个人资料</b>",
@@ -1453,6 +1492,7 @@ def build_payment_message(uid: int, amount: float, code: str, bep20_amount: floa
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
+    maybe_register_admin(message.from_user)
     user = get_user(message.from_user.id, message.from_user.first_name)
     await message.answer(
         t(message.from_user.id, "welcome", name=user["name"]),
@@ -1630,13 +1670,13 @@ async def notify_admins_pix(scan_id: int, code_text: str):
             print(f"[pix] notify admin {aid} failed: {e}")
 
 async def process_pix_submission(message: types.Message, kind: str, file_id, code_text: str):
+    """Charge the user and forward whatever they sent (QR image or PIX text)
+    straight to the admins. We do NOT require it to be a decodable PIX —
+    the admin reads/pays it manually."""
     uid = message.from_user.id
     if not pix_scan_enabled():
         await message.answer(t(uid, "pix_disabled"))
         awaiting_pix.discard(uid)
-        return
-    if not code_text or not looks_like_pix_code(code_text):
-        await message.reply(t(uid, "pix_not_recognized"))
         return
 
     price = pix_scan_price()
@@ -1655,8 +1695,12 @@ async def process_pix_submission(message: types.Message, kind: str, file_id, cod
 
     # Charge and create the pending scan
     update_balance(uid, -price)
-    info, pix_value = summarize_pix(code_text)
-    content = file_id if kind == "photo" else code_text
+    # If we managed to auto-read a valid PIX, show its details; otherwise stay neutral.
+    if code_text and looks_like_pix_code(code_text):
+        info, pix_value = summarize_pix(code_text)
+    else:
+        info, pix_value = (t(uid, "pix_sent_neutral"), None)
+    content = file_id if kind == "photo" else (code_text or "")
     minutes = pix_scan_timeout_min()
     scan_id = create_pix_scan(uid, kind, content, price, pix_value, info, minutes)
     awaiting_pix.discard(uid)
@@ -1668,24 +1712,25 @@ async def process_pix_submission(message: types.Message, kind: str, file_id, cod
             [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")],
         ])
     )
-    await notify_admins_pix(scan_id, code_text)
+    # Forward the decoded code to admins only when it actually parsed.
+    fwd_code = code_text if (code_text and looks_like_pix_code(code_text)) else ""
+    await notify_admins_pix(scan_id, fwd_code)
 
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
     uid = message.from_user.id
     if uid not in awaiting_pix:
         return
-    # Largest photo size is the last in the list
+    # Largest photo size is the last in the list. We forward the image by its
+    # file_id, so we don't strictly need to decode it — decoding is best-effort.
     file_id = message.photo[-1].file_id
+    code_text = None
     try:
         tg_file = await bot.get_file(file_id)
         buf = await bot.download_file(tg_file.file_path)
-        img_bytes = buf.read()
+        code_text = decode_qr_from_bytes(buf.read())
     except Exception as e:
-        print(f"[pix] download failed: {e}")
-        await message.reply(t(uid, "pix_not_recognized"))
-        return
-    code_text = decode_qr_from_bytes(img_bytes)
+        print(f"[pix] decode/download failed (forwarding image anyway): {e}")
     await process_pix_submission(message, "photo", file_id, code_text)
 
 
@@ -1923,7 +1968,7 @@ async def language_menu(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en")],
         [InlineKeyboardButton(text="🇧🇷 Português (Brasil)", callback_data="lang_pt")],
         [InlineKeyboardButton(text="🇮🇩 Bahasa Indonesia", callback_data="lang_id")],
-        [InlineKeyboardButton(text="🇮🇳 हिंदी (Hindi)", callback_data="lang_hi")],
+        [InlineKeyboardButton(text="🇮🇳 हिं��ी (Hindi)", callback_data="lang_hi")],
         [InlineKeyboardButton(text="🇹🇭 ภาษาไทย (Thai)", callback_data="lang_th")],
         [InlineKeyboardButton(text="🇨🇳 中文 (Chinese)", callback_data="lang_zh")],
         [InlineKeyboardButton(text="🇪🇸 Español", callback_data="lang_es")],
@@ -2049,6 +2094,7 @@ async def show_admin_home(message_or_cb, edit: bool):
 
 @dp.message(Command("admin"))
 async def admin_cmd(message: types.Message):
+    maybe_register_admin(message.from_user)
     uid = message.from_user.id
     if not is_admin(uid):
         return
@@ -2098,7 +2144,7 @@ def admin_product_kb(p: dict) -> InlineKeyboardMarkup:
     # Stock row: auto products manage stock via the item pool
     if is_auto:
         rows.append([
-            InlineKeyboardButton(text="📥 Itens (estoque)", callback_data=f"admin_items_{pid}"),
+            InlineKeyboardButton(text="�� Itens (estoque)", callback_data=f"admin_items_{pid}"),
             InlineKeyboardButton(text="😀 Emoji", callback_data=f"admin_edit_emoji_{pid}"),
         ])
     else:
@@ -2930,6 +2976,7 @@ async def scanner_loop():
 # ================== RUN ==================
 async def main():
     init_db()
+    load_extra_admins()
     print("SukoShop Bot running...")
     # Drop any webhook + queued updates so this instance starts clean.
     try:
