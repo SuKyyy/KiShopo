@@ -516,6 +516,10 @@ def pix_scan_timeout_min() -> int:
 def pix_scan_enabled() -> bool:
     return get_setting("pix_scan_enabled", "1") == "1"
 
+def pix_scan_rest() -> bool:
+    """Rest mode: service is on (button visible) but temporarily not taking scans."""
+    return get_setting("pix_scan_rest", "0") == "1"
+
 def _emv_parse(code: str) -> dict:
     """Parse an EMV BR Code (PIX copia-e-cola) TLV string into {tag: value}."""
     result = {}
@@ -718,7 +722,7 @@ LANGS = {
         "option1_binance_id": "Binance ID",
         "option1_amount": "Amount",
         "option1_note": "Note",
-        "option1_steps": "B. Binance → Pay → Send → paste ID above\n⚠️ Note MUST be exact!",
+        "option1_steps": "B. Binance → Pay → Send �� paste ID above\n⚠️ Note MUST be exact!",
         "option2_title": "🔷 OPTION 2: WALLET TRANSFER (BEP20)",
         "option2_address": "Address",
         "option2_network": "Network: <b>BEP20</b>",
@@ -754,6 +758,7 @@ LANGS = {
         "pix_scan_send": "Send the QR image or the PIX code now:",
         "pix_not_recognized": "❌ Couldn't read a valid PIX there. Send a clear QR image or the copy-and-paste code.",
         "pix_sent_neutral": "📨 Your PIX was sent for manual processing.",
+        "pix_timer": "⏳ Time left: <b>{time}</b>",
         "pix_insufficient": "❌ Insufficient balance. Each scan costs ${price:.2f}. Your balance: ${balance:.2f}. Please deposit first.",
         "pix_pending": (
             "✅ <b>PIX received!</b>\n\n{info}\n\n"
@@ -766,6 +771,7 @@ LANGS = {
             "↩️ <b>Refund issued</b>\n\nScan #{sid} wasn't processed in time, so ${price:.2f} was returned to your balance."
         ),
         "pix_disabled": "📷 The Read PIX service is currently unavailable. Try again later.",
+        "pix_rest": "😴 We're not accepting PIX scans right now. Please try again later.",
         "pix_cancel": "❌ Cancel",
     },
     "pt": {
@@ -859,6 +865,7 @@ LANGS = {
         "pix_scan_send": "Envie a imagem do QR ou o código PIX agora:",
         "pix_not_recognized": "❌ Não consegui ler um PIX válido aí. Envie uma imagem nítida do QR ou o código copia e cola.",
         "pix_sent_neutral": "📨 Seu PIX foi enviado para processamento manual.",
+        "pix_timer": "⏳ Tempo restante: <b>{time}</b>",
         "pix_insufficient": "❌ Saldo insuficiente. Cada leitura custa ${price:.2f}. Seu saldo: ${balance:.2f}. Faça um depósito primeiro.",
         "pix_pending": (
             "✅ <b>PIX recebido!</b>\n\n{info}\n\n"
@@ -871,6 +878,7 @@ LANGS = {
             "↩️ <b>Reembolso realizado</b>\n\nA leitura #{sid} não foi processada a tempo, então ${price:.2f} voltou pro seu saldo."
         ),
         "pix_disabled": "📷 O serviço de Ler PIX está indisponível no momento. Tente mais tarde.",
+        "pix_rest": "😴 Não estou aceitando scans de PIX por agora. Tente novamente mais tarde.",
         "pix_cancel": "❌ Cancelar",
     },
     "id": {
@@ -985,7 +993,7 @@ LANGS = {
         "support_title": "🛟 <b>सहायता</b>",
         "support_text": "👤 एडमिन: <a href='{admin_url}'>{admin}</a>\n\n⏰ समय: सुबह 8 - रात 10",
         "language_title": "🌐 <b>भाषा चुनें</b>",
-        "lang_changed": "भाषा हिंदी में बदली!",
+        "lang_changed": "भाषा हिंद��� में बदली!",
         "out_of_stock_alert": "स्टॉक खत्म!",
         "enter_qty": "मात्रा दर्ज करें (1-{max}):\n\n💵 आपका बैलेंस: <b>${balance:.2f} USDT</b>",
         "invalid_qty": "अमान्य मात्रा। 1 और {max} के बीच संख्या दर्ज करें।",
@@ -1075,7 +1083,7 @@ LANGS = {
         "option2_address": "ที่อยู่",
         "option2_network": "เครือข่าย: <b>BEP20</b>",
         "option2_amount": "จำนวน",
-        "option2_warning": "⚠️ ส่งจำนวนนี้เท่านั้น!\n⚠️ ใช้เครือข่าย <b>BEP20</b> เท่านั้น!",
+        "option2_warning": "⚠️ ส่งจำนวนนี้เท่านั้��!\n⚠️ ใช้เครือข่าย <b>BEP20</b> เท่านั้น!",
         "auto_detect": "⏱ ตรวจจับอัตโนมัติภายใน 1-2 นาที\nคุณจะได้รับแจ้งเมื่อเงินเข้า!",
         "auto_detect_buy": "⏱ ตรวจจับอัตโนมัติภายใน 1-2 นาที\nสินค้าจะถูกส่งอัตโนมัติ!\n⏰ การชำระเงินหมดอายุ���น 10 นาที",
         "cancel_payment": "❌ ยกเลิก",
@@ -1610,6 +1618,9 @@ async def pix_scan_start(callback: types.CallbackQuery):
     if not pix_scan_enabled():
         await callback.answer(t(uid, "pix_disabled"), show_alert=True)
         return
+    if pix_scan_rest():
+        await callback.answer(t(uid, "pix_rest"), show_alert=True)
+        return
     awaiting_pix.add(uid)
     price = pix_scan_price()
     minutes = pix_scan_timeout_min()
@@ -1669,6 +1680,45 @@ async def notify_admins_pix(scan_id: int, code_text: str):
         except Exception as e:
             print(f"[pix] notify admin {aid} failed: {e}")
 
+def _fmt_mmss(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+def build_pix_pending_text(uid: int, info: str, price: float, remaining_seconds: int) -> str:
+    """Pending message shown to the client, including a live countdown line."""
+    base = t(uid, "pix_pending", info=info, price=price,
+             minutes=pix_scan_timeout_min())
+    timer = t(uid, "pix_timer", time=_fmt_mmss(remaining_seconds))
+    return f"{base}\n\n{timer}"
+
+async def pix_countdown(uid: int, chat_id: int, message_id: int, scan_id: int,
+                        info: str, price: float):
+    """Edit the client's pending message every minute with the time left,
+    until the scan is resolved or the deadline passes."""
+    while True:
+        await asyncio.sleep(60)
+        scan = get_pix_scan(scan_id)
+        if not scan or scan["status"] != "pending":
+            return  # confirmed/refunded — the status handlers post the final message
+        try:
+            expires = datetime.strptime(scan["expires_at"], "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            return
+        remaining = (expires - datetime.now()).total_seconds()
+        if remaining <= 0:
+            return  # the expiry loop will refund and notify
+        try:
+            await bot.edit_message_text(
+                build_pix_pending_text(uid, info, price, remaining),
+                chat_id=chat_id, message_id=message_id, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")],
+                ])
+            )
+        except Exception:
+            # Message deleted, identical content, or rate-limited — keep ticking.
+            pass
+
 async def process_pix_submission(message: types.Message, kind: str, file_id, code_text: str):
     """Charge the user and forward whatever they sent (QR image or PIX text)
     straight to the admins. We do NOT require it to be a decodable PIX —
@@ -1676,6 +1726,10 @@ async def process_pix_submission(message: types.Message, kind: str, file_id, cod
     uid = message.from_user.id
     if not pix_scan_enabled():
         await message.answer(t(uid, "pix_disabled"))
+        awaiting_pix.discard(uid)
+        return
+    if pix_scan_rest():
+        await message.answer(t(uid, "pix_rest"))
         awaiting_pix.discard(uid)
         return
 
@@ -1705,13 +1759,16 @@ async def process_pix_submission(message: types.Message, kind: str, file_id, cod
     scan_id = create_pix_scan(uid, kind, content, price, pix_value, info, minutes)
     awaiting_pix.discard(uid)
 
-    await message.answer(
-        t(uid, "pix_pending", info=info, price=price, minutes=minutes),
+    total_seconds = minutes * 60
+    sent = await message.answer(
+        build_pix_pending_text(uid, info, price, total_seconds),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")],
         ])
     )
+    # Live countdown that ticks every minute until done/refunded/expired.
+    asyncio.create_task(pix_countdown(uid, sent.chat.id, sent.message_id, scan_id, info, price))
     # Forward the decoded code to admins only when it actually parsed.
     fwd_code = code_text if (code_text and looks_like_pix_code(code_text)) else ""
     await notify_admins_pix(scan_id, fwd_code)
@@ -2003,10 +2060,15 @@ def admin_main_kb() -> InlineKeyboardMarkup:
 
 def admin_pix_kb() -> InlineKeyboardMarkup:
     enabled = pix_scan_enabled()
+    resting = pix_scan_rest()
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="🟢 Serviço LIGADO ▸ desligar" if enabled else "🔴 Serviço DESLIGADO ▸ ligar",
             callback_data="admin_pix_toggle"
+        )],
+        [InlineKeyboardButton(
+            text="😴 Modo descanso ATIVO ▸ voltar a aceitar" if resting else "☕ Ativar modo descanso",
+            callback_data="admin_pix_rest"
         )],
         [InlineKeyboardButton(text="💵 Mudar preço por leitura", callback_data="admin_pix_price")],
         [InlineKeyboardButton(text="⏳ Mudar tempo limite", callback_data="admin_pix_timeout")],
@@ -2014,14 +2076,22 @@ def admin_pix_kb() -> InlineKeyboardMarkup:
     ])
 
 async def render_admin_pix(target, edit: bool):
+    if not pix_scan_enabled():
+        estado = "🔴 Desligado"
+    elif pix_scan_rest():
+        estado = "😴 Em descanso (não aceitando scans)"
+    else:
+        estado = "🟢 Ligado"
     text = (
         "📷 <b>CONFIG — LER PIX</b>\n\n"
-        f"Estado: <b>{'🟢 Ligado' if pix_scan_enabled() else '🔴 Desligado'}</b>\n"
+        f"Estado: <b>{estado}</b>\n"
         f"💵 Preço por leitura: <b>${pix_scan_price():.2f} USDT</b>\n"
         f"⏳ Tempo limite: <b>{pix_scan_timeout_min()} min</b>\n\n"
         "Quando ligado, aparece o botão “📷 Ler PIX” no menu dos clientes. "
         "Eles enviam o QR/código, são cobrados, e você recebe aqui pra ler. "
-        "Se você não confirmar no tempo limite, o cliente é reembolsado automaticamente."
+        "Se você não confirmar no tempo limite, o cliente é reembolsado automaticamente.\n\n"
+        "☕ <b>Modo descanso</b>: pausa temporária. O botão continua visível, mas quem tentar "
+        "usar recebe um aviso de que você não está aceitando scans agora."
     )
     if edit:
         await target.message.edit_text(text, reply_markup=admin_pix_kb(), parse_mode="HTML")
@@ -2044,6 +2114,18 @@ async def admin_pix_toggle(callback: types.CallbackQuery):
         await callback.answer("Acesso negado.", show_alert=True)
         return
     set_setting("pix_scan_enabled", "0" if pix_scan_enabled() else "1")
+    await render_admin_pix(callback, edit=True)
+
+@dp.callback_query(F.data == "admin_pix_rest")
+async def admin_pix_rest_toggle(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    now_resting = not pix_scan_rest()
+    set_setting("pix_scan_rest", "1" if now_resting else "0")
+    await callback.answer("😴 Modo descanso ativado." if now_resting
+                          else "✅ Voltando a aceitar scans.")
     await render_admin_pix(callback, edit=True)
 
 @dp.callback_query(F.data == "admin_pix_price")
