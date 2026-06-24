@@ -865,7 +865,7 @@ LANGS = {
         "out_of_stock_alert": "Produto esgotado!",
         "enter_qty": "Digite a quantidade (1-{max}):\n\n💵 Seu saldo: <b>${balance:.2f} USDT</b>",
         "invalid_qty": "Quantidade inválida. Digite um número entre 1 e {max}.",
-        "insufficient_balance": "Saldo insuficiente! Você precisa de ${needed:.2f} USDT mas tem ${balance:.2f} USDT.\nFaça um depósito primeiro.",
+        "insufficient_balance": "Saldo insuficiente! Você precisa de ${needed:.2f} USDT mas tem ${balance:.2f} USDT.\nFaça um dep��sito primeiro.",
         "waiting_payment": "⏳ <b>AGUARDANDO PAGAMENTO...</b>",
         "payment_expired": "Pagamento expirado. Tente novamente.",
         "deposit_info_title": "💵 <b>INFO DE DEPÓSITO USDT</b>",
@@ -1104,7 +1104,7 @@ LANGS = {
         "withdraw_text": (
             "วิธีถอนยอดคงเหลือ:\n\n"
             "1. ติดต่อ <a href='{admin_url}'>{admin}</a>\n"
-            "2. แจ้งที่อยู่ BEP20 และจำนวน\n"
+            "2. แจ้งท���่อยู่ BEP20 และจำนวน\n"
             "3. ดำเนินการภายใน 24 ชั่วโมง"
         ),
         "support_title": "🛟 <b>ฝ่ายสนับสนุน</b>",
@@ -2459,6 +2459,22 @@ async def admin_items(callback: types.CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
 
+# A separator line made only of dash-like chars: ASCII hyphen, en-dash, em-dash, horizontal bar.
+SEP_DASH_RE = re.compile(r"(?m)^[ \t]*[-\u2013\u2014\u2015]+[ \t]*$")
+
+def parse_stock_items(text: str, mode: str):
+    """Split admin-pasted text into individual stock items according to mode:
+    - "line":  every non-empty line is one item (e.g. email:senha lists)
+    - "blank": items separated by a blank line (one or more)
+    - "block": items separated by a dash line (---, ——, –, etc.)"""
+    if mode == "block":
+        parts = SEP_DASH_RE.split(text)
+    elif mode == "blank":
+        parts = re.split(r"\n\s*\n", text)
+    else:  # line
+        parts = text.splitlines()
+    return [p.strip() for p in parts if p.strip()]
+
 @dp.callback_query(F.data.startswith("admin_additems_"))
 async def admin_add_items(callback: types.CallbackQuery):
     uid = callback.from_user.id
@@ -2469,13 +2485,16 @@ async def admin_add_items(callback: types.CallbackQuery):
     await callback.message.edit_text(
         "📥 <b>Adicionar itens</b>\n\n"
         "Como você quer separar os itens que vai enviar?\n\n"
-        "📄 <b>Uma linha = 1 item</b> — cada quebra de linha é um item separado.\n\n"
-        "🧱 <b>Separado por ---</b> — cada bloco entre <code>---</code> é 1 item "
-        "(use quando 1 item ocupa várias linhas, ex: conta com login, senha e instruções).",
+        "📄 <b>Uma linha = 1 item</b> — cada quebra de linha vira um item "
+        "(ex: listas de <code>email:senha</code>).\n\n"
+        "⬜ <b>Linha em branco</b> — cada item é separado por uma linha vazia "
+        "(use quando o item tem várias linhas).\n\n"
+        "🧱 <b>Traço (--- ou ——)</b> — cada item é separado por uma linha de traços.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📄 Uma linha = 1 item", callback_data=f"admin_addmode_line_{pid}")],
-            [InlineKeyboardButton(text="🧱 Separado por ---", callback_data=f"admin_addmode_block_{pid}")],
+            [InlineKeyboardButton(text="⬜ Separado por linha em branco", callback_data=f"admin_addmode_blank_{pid}")],
+            [InlineKeyboardButton(text="🧱 Separado por traço (--- ou ——)", callback_data=f"admin_addmode_block_{pid}")],
             [InlineKeyboardButton(text="❌ Cancelar", callback_data=f"admin_items_{pid}")],
         ])
     )
@@ -2491,9 +2510,16 @@ async def admin_add_items_mode(callback: types.CallbackQuery):
     admin_state[uid] = {"action": "add_items", "pid": pid, "mode": mode}
     if mode == "block":
         body = (
-            "🧱 Envie os itens <b>separados por <code>---</code></b> (cada bloco = 1 item, "
-            "pode ter várias linhas).\n\nEx:\n"
-            "<code>Gmail: a@x.com\nSenha: 123\nLink: site.com\n---\nGmail: b@x.com\nSenha: 456</code>\n\n"
+            "🧱 Envie os itens <b>separados por uma linha de traços</b> (<code>---</code> ou <code>——</code>). "
+            "Cada bloco = 1 item e pode ter várias linhas.\n\nEx:\n"
+            "<code>Gmail: a@x.com\nSenha: 123\nLink: site.com\n——\nGmail: b@x.com\nSenha: 456</code>\n\n"
+            "(isso vira <b>2 itens</b>)"
+        )
+    elif mode == "blank":
+        body = (
+            "⬜ Envie os itens <b>separados por uma linha em branco</b>. "
+            "Cada bloco = 1 item e pode ter várias linhas.\n\nEx:\n"
+            "<code>Gmail: a@x.com Senha: 123\n\nGmail: b@x.com Senha: 456</code>\n\n"
             "(isso vira <b>2 itens</b>)"
         )
     else:
@@ -2697,7 +2723,7 @@ async def admin_items_panel(callback: types.CallbackQuery, pid: str):
     )
 
 EDIT_FIELD_PROMPTS = {
-    "name": "✏️ Envie o novo <b>nome</b> do produto:",
+    "name": "��️ Envie o novo <b>nome</b> do produto:",
     "price": "💵 Envie o novo <b>preço</b> (ex: <code>9.99</code>):",
     "stock": "📦 Envie o novo <b>estoque</b> (número inteiro):",
     "emoji": "😀 Envie o novo <b>emoji</b> do produto:",
@@ -2957,12 +2983,7 @@ async def handle_admin_text(message: types.Message) -> bool:
             await message.answer("Produto não encontrado.", reply_markup=admin_main_kb())
             return True
         mode = st.get("mode", "line")
-        if mode == "block":
-            # Each block separated by a line containing only '---' is one item.
-            blocks = re.split(r"(?m)^\s*-{3,}\s*$", message.text)
-            items = [b.strip() for b in blocks if b.strip()]
-        else:
-            items = [line.strip() for line in message.text.splitlines() if line.strip()]
+        items = parse_stock_items(message.text, mode)
         if not items:
             await message.reply("Nenhum item válido. Envie pelo menos um item.")
             return True
