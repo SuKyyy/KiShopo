@@ -754,6 +754,7 @@ LANGS = {
         "pix_scan_send": "Send the QR image or the PIX code now:",
         "pix_not_recognized": "❌ Couldn't read a valid PIX there. Send a clear QR image or the copy-and-paste code.",
         "pix_sent_neutral": "📨 Your PIX was sent for manual processing.",
+        "pix_timer": "⏳ Time left: <b>{time}</b>",
         "pix_insufficient": "❌ Insufficient balance. Each scan costs ${price:.2f}. Your balance: ${balance:.2f}. Please deposit first.",
         "pix_pending": (
             "✅ <b>PIX received!</b>\n\n{info}\n\n"
@@ -859,6 +860,7 @@ LANGS = {
         "pix_scan_send": "Envie a imagem do QR ou o código PIX agora:",
         "pix_not_recognized": "❌ Não consegui ler um PIX válido aí. Envie uma imagem nítida do QR ou o código copia e cola.",
         "pix_sent_neutral": "📨 Seu PIX foi enviado para processamento manual.",
+        "pix_timer": "⏳ Tempo restante: <b>{time}</b>",
         "pix_insufficient": "❌ Saldo insuficiente. Cada leitura custa ${price:.2f}. Seu saldo: ${balance:.2f}. Faça um depósito primeiro.",
         "pix_pending": (
             "✅ <b>PIX recebido!</b>\n\n{info}\n\n"
@@ -1669,6 +1671,45 @@ async def notify_admins_pix(scan_id: int, code_text: str):
         except Exception as e:
             print(f"[pix] notify admin {aid} failed: {e}")
 
+def _fmt_mmss(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+def build_pix_pending_text(uid: int, info: str, price: float, remaining_seconds: int) -> str:
+    """Pending message shown to the client, including a live countdown line."""
+    base = t(uid, "pix_pending", info=info, price=price,
+             minutes=pix_scan_timeout_min())
+    timer = t(uid, "pix_timer", time=_fmt_mmss(remaining_seconds))
+    return f"{base}\n\n{timer}"
+
+async def pix_countdown(uid: int, chat_id: int, message_id: int, scan_id: int,
+                        info: str, price: float):
+    """Edit the client's pending message every minute with the time left,
+    until the scan is resolved or the deadline passes."""
+    while True:
+        await asyncio.sleep(60)
+        scan = get_pix_scan(scan_id)
+        if not scan or scan["status"] != "pending":
+            return  # confirmed/refunded — the status handlers post the final message
+        try:
+            expires = datetime.strptime(scan["expires_at"], "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            return
+        remaining = (expires - datetime.now()).total_seconds()
+        if remaining <= 0:
+            return  # the expiry loop will refund and notify
+        try:
+            await bot.edit_message_text(
+                build_pix_pending_text(uid, info, price, remaining),
+                chat_id=chat_id, message_id=message_id, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")],
+                ])
+            )
+        except Exception:
+            # Message deleted, identical content, or rate-limited — keep ticking.
+            pass
+
 async def process_pix_submission(message: types.Message, kind: str, file_id, code_text: str):
     """Charge the user and forward whatever they sent (QR image or PIX text)
     straight to the admins. We do NOT require it to be a decodable PIX —
@@ -1705,13 +1746,16 @@ async def process_pix_submission(message: types.Message, kind: str, file_id, cod
     scan_id = create_pix_scan(uid, kind, content, price, pix_value, info, minutes)
     awaiting_pix.discard(uid)
 
-    await message.answer(
-        t(uid, "pix_pending", info=info, price=price, minutes=minutes),
+    total_seconds = minutes * 60
+    sent = await message.answer(
+        build_pix_pending_text(uid, info, price, total_seconds),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")],
         ])
     )
+    # Live countdown that ticks every minute until done/refunded/expired.
+    asyncio.create_task(pix_countdown(uid, sent.chat.id, sent.message_id, scan_id, info, price))
     # Forward the decoded code to admins only when it actually parsed.
     fwd_code = code_text if (code_text and looks_like_pix_code(code_text)) else ""
     await notify_admins_pix(scan_id, fwd_code)
