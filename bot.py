@@ -502,10 +502,33 @@ async def translate_text(text: str, target_lang: str) -> str:
 # ================== PIX SCAN (read & pay) ==================
 # Default config (stored in app_settings, editable by admin)
 def pix_scan_price() -> float:
+    """Global price per scan (default for everyone)."""
     try:
         return float(get_setting("pix_scan_price", "0.5"))
     except ValueError:
         return 0.5
+
+def get_user_pix_price(uid: int):
+    """Return the per-user price override, or None if the user uses the global price."""
+    raw = get_setting(f"pix_price_user_{uid}", "")
+    if raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+def set_user_pix_price(uid: int, price):
+    """Set (price as float) or clear (price None) a per-user price override."""
+    if price is None:
+        set_setting(f"pix_price_user_{uid}", "")
+    else:
+        set_setting(f"pix_price_user_{uid}", str(price))
+
+def pix_scan_price_for(uid: int) -> float:
+    """Effective price for a given user: individual override if set, else global."""
+    override = get_user_pix_price(uid)
+    return override if override is not None else pix_scan_price()
 
 def pix_scan_timeout_min() -> int:
     try:
@@ -980,7 +1003,7 @@ LANGS = {
         "history_title": "📜 <b>ऑर्डर हिस्ट्री</b>",
         "no_orders": "📜 अभी तक कोई ऑर्डर नहीं।",
         "wallet_title": "💰 <b>वॉलेट</b>",
-        "usdt_balance": "USDT बैलेंस",
+        "usdt_balance": "USDT बैलें���",
         "deposit_btn": "➕ डिपॉजिट",
         "withdraw_btn": "💸 निकासी",
         "withdraw_title": "💸 <b>निकासी</b>",
@@ -1078,7 +1101,7 @@ LANGS = {
         "option1_binance_id": "Binance ID",
         "option1_amount": "จำนวน",
         "option1_note": "หมายเหตุ",
-        "option1_steps": "B. Binance → Pay → Send → วาง ID ด้านบน\n⚠️ หมายเหตุต้องถูกต้องทุกต��วอักษร!",
+        "option1_steps": "B. Binance → Pay → Send → วาง ID ด้านบน\n⚠️ หมายเหตุต้องถูกต้องทุกต��วอั���ษร!",
         "option2_title": "🔷 ตัวเลือก 2: โอนกระเป๋า (BEP20)",
         "option2_address": "ที่อยู่",
         "option2_network": "เครือข่าย: <b>BEP20</b>",
@@ -1225,7 +1248,7 @@ LANGS = {
         "option2_address": "Dirección",
         "option2_network": "Red: <b>BEP20</b>",
         "option2_amount": "Monto",
-        "option2_warning": "⚠️ Envía EXACTAMENTE este monto!\n⚠️ Usa red <b>BEP20</b> SOLO!",
+        "option2_warning": "⚠️ Env��a EXACTAMENTE este monto!\n⚠️ Usa red <b>BEP20</b> SOLO!",
         "auto_detect": "⏱ Detección automática en 1-2 minutos.\nSe te notificará cuando los fondos se añadan!",
         "auto_detect_buy": "⏱ Detección automática en 1-2 minutos.\nEl producto se entregará automáticamente!\n⏰ El pago expira en 10 minutos.",
         "cancel_payment": "❌ Cancelar",
@@ -1622,7 +1645,7 @@ async def pix_scan_start(callback: types.CallbackQuery):
         await callback.answer(t(uid, "pix_rest"), show_alert=True)
         return
     awaiting_pix.add(uid)
-    price = pix_scan_price()
+    price = pix_scan_price_for(uid)
     minutes = pix_scan_timeout_min()
     await callback.message.edit_text(
         t(uid, "pix_scan_intro", price=price, minutes=minutes),
@@ -1733,7 +1756,7 @@ async def process_pix_submission(message: types.Message, kind: str, file_id, cod
         awaiting_pix.discard(uid)
         return
 
-    price = pix_scan_price()
+    price = pix_scan_price_for(uid)
     user = get_user(uid)
     if user["balance"] < price:
         awaiting_pix.discard(uid)
@@ -1902,7 +1925,7 @@ async def handle_text(message: types.Message):
             f"💵 {t(uid, 'option2_amount')}:\n"
             f"<code>{bep20_amount}</code>\n\n"
             f"{t(uid, 'option2_warning')}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━���━━━━━━━\n"
             f"{t(uid, 'auto_detect_buy')}"
         )
         await message.answer(
@@ -2070,7 +2093,8 @@ def admin_pix_kb() -> InlineKeyboardMarkup:
             text="😴 Modo descanso ATIVO ▸ voltar a aceitar" if resting else "☕ Ativar modo descanso",
             callback_data="admin_pix_rest"
         )],
-        [InlineKeyboardButton(text="💵 Mudar preço por leitura", callback_data="admin_pix_price")],
+        [InlineKeyboardButton(text="💵 Preço global", callback_data="admin_pix_price")],
+        [InlineKeyboardButton(text="👤 Preço por usuário", callback_data="admin_pix_price_user")],
         [InlineKeyboardButton(text="⏳ Mudar tempo limite", callback_data="admin_pix_timeout")],
         [InlineKeyboardButton(text="⬅️ Voltar", callback_data="admin")],
     ])
@@ -2085,11 +2109,13 @@ async def render_admin_pix(target, edit: bool):
     text = (
         "📷 <b>CONFIG — LER PIX</b>\n\n"
         f"Estado: <b>{estado}</b>\n"
-        f"💵 Preço por leitura: <b>${pix_scan_price():.2f} USDT</b>\n"
+        f"💵 Preço global por leitura: <b>${pix_scan_price():.2f} USDT</b>\n"
         f"⏳ Tempo limite: <b>{pix_scan_timeout_min()} min</b>\n\n"
         "Quando ligado, aparece o botão “📷 Ler PIX” no menu dos clientes. "
         "Eles enviam o QR/código, são cobrados, e você recebe aqui pra ler. "
         "Se você não confirmar no tempo limite, o cliente é reembolsado automaticamente.\n\n"
+        "💵 <b>Preço global</b>: vale para todos. "
+        "👤 <b>Preço por usuário</b>: define um valor especial para um cliente específico (sobrescreve o global).\n\n"
         "☕ <b>Modo descanso</b>: pausa temporária. O botão continua visível, mas quem tentar "
         "usar recebe um aviso de que você não está aceitando scans agora."
     )
@@ -2136,7 +2162,26 @@ async def admin_pix_price(callback: types.CallbackQuery):
         return
     admin_state[uid] = {"action": "pix_price"}
     await callback.message.edit_text(
-        "💵 Envie o novo <b>preço por leitura</b> em USDT (ex: <code>0.5</code>):",
+        "💵 Envie o novo <b>preço global por leitura</b> em USDT (ex: <code>0.5</code>):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancelar", callback_data="admin_pix")]
+        ])
+    )
+
+@dp.callback_query(F.data == "admin_pix_price_user")
+async def admin_pix_price_user(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    admin_state[uid] = {"action": "pix_price_user"}
+    await callback.message.edit_text(
+        "👤 <b>Preço por usuário</b>\n\n"
+        "Envie o <b>ID do usuário</b> e o <b>preço</b> separados por espaço.\n\n"
+        "Ex: <code>7658392821 0.75</code> — cobra $0.75 desse usuário.\n"
+        "Para <b>remover</b> o preço especial (voltar ao global), envie o ID e a palavra "
+        "<code>remover</code>. Ex: <code>7658392821 remover</code>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Cancelar", callback_data="admin_pix")]
@@ -2574,7 +2619,38 @@ async def handle_admin_text(message: types.Message) -> bool:
             return True
         set_setting("pix_scan_price", str(value))
         admin_state.pop(uid, None)
-        await message.answer(f"✅ Preço por leitura definido em ${value:.2f} USDT.")
+        await message.answer(f"✅ Preço global por leitura definido em ${value:.2f} USDT.")
+        await render_admin_pix(message, edit=False)
+        return True
+
+    if action == "pix_price_user":
+        parts = txt.split()
+        if len(parts) != 2 or not parts[0].isdigit():
+            await message.reply("Formato inválido. Envie: ID e preço. Ex: 7658392821 0.75 "
+                                "(ou 7658392821 remover)")
+            return True
+        target_id = int(parts[0])
+        arg = parts[1].lower()
+        if arg in ("remover", "remove", "global", "padrao", "padrão"):
+            set_user_pix_price(target_id, None)
+            admin_state.pop(uid, None)
+            await message.answer(f"✅ Preço especial removido. Usuário <code>{target_id}</code> "
+                                 f"volta ao preço global (${pix_scan_price():.2f}).",
+                                 parse_mode="HTML")
+            await render_admin_pix(message, edit=False)
+            return True
+        try:
+            value = round(float(arg.replace(",", ".")), 2)
+            if value < 0:
+                raise ValueError
+        except ValueError:
+            await message.reply("Preço inválido. Ex: 7658392821 0.75")
+            return True
+        set_user_pix_price(target_id, value)
+        admin_state.pop(uid, None)
+        await message.answer(f"✅ Preço do usuário <code>{target_id}</code> definido em "
+                             f"${value:.2f} USDT (sobrescreve o global).",
+                             parse_mode="HTML")
         await render_admin_pix(message, edit=False)
         return True
 
