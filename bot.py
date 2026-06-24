@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import random
 import string
 import time
@@ -416,6 +417,28 @@ def add_stock_items(pid: str, items: list, kind: str = "text"):
         for content in items:
             c.execute("INSERT INTO stock_items (product_id, content, kind, used) VALUES (%s,%s,%s,FALSE)",
                       (pid, content, kind))
+    return sync_auto_stock(pid)
+
+def list_stock_items(pid: str, limit: int, offset: int):
+    """Return unused stock items (id, content, kind) for admin management."""
+    with db_cursor() as c:
+        c.execute("""SELECT id, content, kind FROM stock_items
+                     WHERE product_id=%s AND used=FALSE
+                     ORDER BY id ASC LIMIT %s OFFSET %s""", (pid, limit, offset))
+        return [dict(r) for r in c.fetchall()]
+
+def delete_stock_items(pid: str, ids: list):
+    """Delete specific unused items by id (scoped to the product). Returns new total."""
+    if ids:
+        with db_cursor(commit=True) as c:
+            c.execute("DELETE FROM stock_items WHERE product_id=%s AND used=FALSE AND id = ANY(%s)",
+                      (pid, list(ids)))
+    return sync_auto_stock(pid)
+
+def delete_all_stock_items(pid: str):
+    """Delete every unused item of a product. Returns 0 (new total)."""
+    with db_cursor(commit=True) as c:
+        c.execute("DELETE FROM stock_items WHERE product_id=%s AND used=FALSE", (pid,))
     return sync_auto_stock(pid)
 
 def pop_stock_items(pid: str, qty: int):
@@ -1091,7 +1114,7 @@ LANGS = {
         "out_of_stock_alert": "สินค้าหมด!",
         "enter_qty": "ป้อนจำนวน (1-{max}):\n\n💵 ยอดของคุณ: <b>${balance:.2f} USDT</b>",
         "invalid_qty": "จำนวนไม่ถูกต้อง กรุณาป้อนตัวเลขระหว่าง 1 ถึง {max}",
-        "insufficient_balance": "ยอดไม่เพียงพอ! คุณต้องการ ${needed:.2f} USDT แต่มี ${balance:.2f} USDT\nกรุณาฝากเงินก่อน",
+        "insufficient_balance": "ยอดไม่เพียงพอ! คุณต้องการ ${needed:.2f} USDT แต่มี ${balance:.2f} USDT\nก���ุณาฝากเงินก่อน",
         "waiting_payment": "⏳ <b>รอการชำระเงิน...</b>",
         "payment_expired": "การชำระเงินหมดเวลา กรุณาลองใหม่",
         "deposit_info_title": "💵 <b>ข้อมูลฝาก USDT</b>",
@@ -1346,6 +1369,8 @@ awaiting_qty = {}
 admin_state = {}
 # Tracks users in "send me your PIX" mode: set of user_ids
 awaiting_pix = set()
+# Tracks admin stock-removal selection: {admin_id: {"pid": str, "selected": set(ids), "page": int}}
+del_selection = {}
 
 # ================== HELPERS ==================
 def t(user_id: int, key: str, **kwargs) -> str:
@@ -2418,17 +2443,20 @@ async def admin_items(callback: types.CallbackQuery):
         await callback.answer("Produto não encontrado.", show_alert=True)
         return
     avail = count_available_items(pid)
+    rows = [
+        [InlineKeyboardButton(text="➕ Adicionar itens", callback_data=f"admin_additems_{pid}")],
+    ]
+    if avail > 0:
+        rows.append([InlineKeyboardButton(text="🗑 Remover itens", callback_data=f"admin_delitems_{pid}_0")])
+    rows.append([InlineKeyboardButton(text="⬅️ Voltar", callback_data=f"admin_prod_{pid}")])
     await callback.message.edit_text(
         f"📥 <b>ESTOQUE DE ITENS</b>\n\n"
         f"Produto: <b>{html.escape(p['name'])}</b>\n"
         f"Itens disponíveis: <b>{avail}</b>\n\n"
-        f"Cada linha que você enviar vira 1 item entregue automaticamente "
-        f"(ex: um login:senha, um código, um link). Toque em adicionar para enviar vários de uma vez.",
+        f"Toque em <b>Adicionar</b> para enviar vários de uma vez, ou <b>Remover</b> "
+        f"para apagar itens individualmente ou em massa.",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Adicionar itens", callback_data=f"admin_additems_{pid}")],
-            [InlineKeyboardButton(text="⬅️ Voltar", callback_data=f"admin_prod_{pid}")],
-        ])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
 
 @dp.callback_query(F.data.startswith("admin_additems_"))
@@ -2438,15 +2466,234 @@ async def admin_add_items(callback: types.CallbackQuery):
         await callback.answer("Acesso negado.", show_alert=True)
         return
     pid = callback.data[len("admin_additems_"):]
-    admin_state[uid] = {"action": "add_items", "pid": pid}
     await callback.message.edit_text(
-        "📥 Envie os itens — <b>um por linha</b>.\n\n"
-        "Cada linha será 1 unidade entregue automaticamente após o pagamento.\n"
-        "Ex:\n<code>email1@x.com:senha123\nemail2@x.com:senha456</code>",
+        "📥 <b>Adicionar itens</b>\n\n"
+        "Como você quer separar os itens que vai enviar?\n\n"
+        "📄 <b>Uma linha = 1 item</b> — cada quebra de linha é um item separado.\n\n"
+        "🧱 <b>Separado por ---</b> — cada bloco entre <code>---</code> é 1 item "
+        "(use quando 1 item ocupa várias linhas, ex: conta com login, senha e instruções).",
         parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📄 Uma linha = 1 item", callback_data=f"admin_addmode_line_{pid}")],
+            [InlineKeyboardButton(text="🧱 Separado por ---", callback_data=f"admin_addmode_block_{pid}")],
+            [InlineKeyboardButton(text="❌ Cancelar", callback_data=f"admin_items_{pid}")],
+        ])
+    )
+
+@dp.callback_query(F.data.startswith("admin_addmode_"))
+async def admin_add_items_mode(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    rest = callback.data[len("admin_addmode_"):]
+    mode, pid = rest.split("_", 1)
+    admin_state[uid] = {"action": "add_items", "pid": pid, "mode": mode}
+    if mode == "block":
+        body = (
+            "🧱 Envie os itens <b>separados por <code>---</code></b> (cada bloco = 1 item, "
+            "pode ter várias linhas).\n\nEx:\n"
+            "<code>Gmail: a@x.com\nSenha: 123\nLink: site.com\n---\nGmail: b@x.com\nSenha: 456</code>\n\n"
+            "(isso vira <b>2 itens</b>)"
+        )
+    else:
+        body = (
+            "📄 Envie os itens — <b>um por linha</b>.\n\n"
+            "Cada linha será 1 unidade entregue automaticamente após o pagamento.\n"
+            "Ex:\n<code>email1@x.com:senha123\nemail2@x.com:senha456</code>"
+        )
+    await callback.message.edit_text(
+        body, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Cancelar", callback_data=f"admin_items_{pid}")]
         ])
+    )
+
+DEL_PER_PAGE = 8
+
+def _item_preview(content: str, kind: str) -> str:
+    if kind == "photo":
+        return "🖼 [imagem QR]"
+    one_line = " ".join((content or "").split())
+    return (one_line[:30] + "…") if len(one_line) > 30 else (one_line or "[vazio]")
+
+async def render_del_items(callback: types.CallbackQuery, pid: str, page: int):
+    uid = callback.from_user.id
+    total = count_available_items(pid)
+    if total == 0:
+        await callback.message.edit_text(
+            "🗑 Não há itens para remover.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Voltar", callback_data=f"admin_items_{pid}")]
+            ])
+        )
+        return
+    max_page = (total - 1) // DEL_PER_PAGE
+    page = max(0, min(page, max_page))
+    sel = del_selection.setdefault(uid, {"pid": pid, "selected": set()})
+    if sel["pid"] != pid:
+        sel["pid"], sel["selected"] = pid, set()
+    selected = sel["selected"]
+    items = list_stock_items(pid, DEL_PER_PAGE, page * DEL_PER_PAGE)
+
+    rows = []
+    for it in items:
+        mark = "☑️" if it["id"] in selected else "⬜"
+        label = f"{mark} #{it['id']} {_item_preview(it['content'], it['kind'])}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"admin_deltog_{it['id']}_{pid}_{page}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_delitems_{pid}_{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{max_page+1}", callback_data="noop"))
+    if page < max_page:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_delitems_{pid}_{page+1}"))
+    rows.append(nav)
+
+    rows.append([
+        InlineKeyboardButton(text="✅ Marcar página", callback_data=f"admin_delpage_{pid}_{page}"),
+        InlineKeyboardButton(text="🧹 Limpar", callback_data=f"admin_delclear_{pid}_{page}"),
+    ])
+    if selected:
+        rows.append([InlineKeyboardButton(text=f"🗑 Apagar selecionados ({len(selected)})",
+                                          callback_data=f"admin_deldo_{pid}_{page}")])
+    rows.append([InlineKeyboardButton(text="🗑 APAGAR TODOS", callback_data=f"admin_delall_{pid}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Voltar", callback_data=f"admin_items_{pid}")])
+
+    await callback.message.edit_text(
+        f"🗑 <b>REMOVER ITENS</b>\n\n"
+        f"Total disponível: <b>{total}</b> · Selecionados: <b>{len(selected)}</b>\n\n"
+        f"Toque num item para marcar/desmarcar. Depois use “Apagar selecionados”, "
+        f"ou use “APAGAR TODOS”.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+
+@dp.callback_query(F.data == "noop")
+async def admin_noop(callback: types.CallbackQuery):
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("admin_delitems_"))
+async def admin_del_items(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    rest = callback.data[len("admin_delitems_"):]
+    pid, page = rest.rsplit("_", 1)
+    await render_del_items(callback, pid, int(page))
+
+@dp.callback_query(F.data.startswith("admin_deltog_"))
+async def admin_del_toggle(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    rest = callback.data[len("admin_deltog_"):]
+    item_id, pid, page = rest.split("_", 2)
+    sel = del_selection.setdefault(uid, {"pid": pid, "selected": set()})
+    if sel["pid"] != pid:
+        sel["pid"], sel["selected"] = pid, set()
+    iid = int(item_id)
+    sel["selected"].discard(iid) if iid in sel["selected"] else sel["selected"].add(iid)
+    await render_del_items(callback, pid, int(page))
+
+@dp.callback_query(F.data.startswith("admin_delpage_"))
+async def admin_del_select_page(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    rest = callback.data[len("admin_delpage_"):]
+    pid, page = rest.rsplit("_", 1)
+    page = int(page)
+    sel = del_selection.setdefault(uid, {"pid": pid, "selected": set()})
+    if sel["pid"] != pid:
+        sel["pid"], sel["selected"] = pid, set()
+    for it in list_stock_items(pid, DEL_PER_PAGE, page * DEL_PER_PAGE):
+        sel["selected"].add(it["id"])
+    await render_del_items(callback, pid, page)
+
+@dp.callback_query(F.data.startswith("admin_delclear_"))
+async def admin_del_clear(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    rest = callback.data[len("admin_delclear_"):]
+    pid, page = rest.rsplit("_", 1)
+    if uid in del_selection:
+        del_selection[uid]["selected"] = set()
+    await render_del_items(callback, pid, int(page))
+
+@dp.callback_query(F.data.startswith("admin_deldo_"))
+async def admin_del_do(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    rest = callback.data[len("admin_deldo_"):]
+    pid, page = rest.rsplit("_", 1)
+    sel = del_selection.get(uid)
+    ids = list(sel["selected"]) if sel and sel.get("pid") == pid else []
+    if not ids:
+        await callback.answer("Nada selecionado.", show_alert=True)
+        return
+    total = delete_stock_items(pid, ids)
+    if sel:
+        sel["selected"] = set()
+    await callback.answer(f"🗑 {len(ids)} item(ns) removido(s).")
+    await render_del_items(callback, pid, int(page))
+
+@dp.callback_query(F.data.startswith("admin_delall_"))
+async def admin_del_all(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    pid = callback.data[len("admin_delall_"):]
+    total = count_available_items(pid)
+    await callback.message.edit_text(
+        f"⚠️ Tem certeza que quer apagar <b>TODOS os {total} itens</b> deste produto?\n\n"
+        f"Essa ação não pode ser desfeita.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Sim, apagar todos", callback_data=f"admin_delconfirmall_{pid}")],
+            [InlineKeyboardButton(text="❌ Cancelar", callback_data=f"admin_delitems_{pid}_0")],
+        ])
+    )
+
+@dp.callback_query(F.data.startswith("admin_delconfirmall_"))
+async def admin_del_all_yes(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    pid = callback.data[len("admin_delconfirmall_"):]
+    delete_all_stock_items(pid)
+    del_selection.pop(uid, None)
+    await callback.answer("🗑 Todos os itens foram removidos.")
+    await admin_items_panel(callback, pid)
+
+async def admin_items_panel(callback: types.CallbackQuery, pid: str):
+    """Re-render the stock panel after deletions."""
+    p = get_product(pid)
+    if not p:
+        await callback.message.edit_text("Produto não encontrado.", reply_markup=admin_main_kb())
+        return
+    avail = count_available_items(pid)
+    rows = [[InlineKeyboardButton(text="➕ Adicionar itens", callback_data=f"admin_additems_{pid}")]]
+    if avail > 0:
+        rows.append([InlineKeyboardButton(text="🗑 Remover itens", callback_data=f"admin_delitems_{pid}_0")])
+    rows.append([InlineKeyboardButton(text="⬅️ Voltar", callback_data=f"admin_prod_{pid}")])
+    await callback.message.edit_text(
+        f"📥 <b>ESTOQUE DE ITENS</b>\n\n"
+        f"Produto: <b>{html.escape(p['name'])}</b>\n"
+        f"Itens disponíveis: <b>{avail}</b>\n\n"
+        f"Toque em <b>Adicionar</b> para enviar vários de uma vez, ou <b>Remover</b> "
+        f"para apagar itens individualmente ou em massa.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
 
 EDIT_FIELD_PROMPTS = {
@@ -2702,16 +2949,22 @@ async def handle_admin_text(message: types.Message) -> bool:
         await render_admin_product(message, pid, edit=False)
         return True
 
-    # ----- Add auto-delivery stock items (one per line) -----
+    # ----- Add auto-delivery stock items (line-by-line or block-by-'---') -----
     if action == "add_items":
         pid = st["pid"]
         if not get_product(pid):
             admin_state.pop(uid, None)
             await message.answer("Produto não encontrado.", reply_markup=admin_main_kb())
             return True
-        items = [line.strip() for line in message.text.splitlines() if line.strip()]
+        mode = st.get("mode", "line")
+        if mode == "block":
+            # Each block separated by a line containing only '---' is one item.
+            blocks = re.split(r"(?m)^\s*-{3,}\s*$", message.text)
+            items = [b.strip() for b in blocks if b.strip()]
+        else:
+            items = [line.strip() for line in message.text.splitlines() if line.strip()]
         if not items:
-            await message.reply("Nenhum item válido. Envie pelo menos uma linha.")
+            await message.reply("Nenhum item válido. Envie pelo menos um item.")
             return True
         total = add_stock_items(pid, items)
         admin_state.pop(uid, None)
