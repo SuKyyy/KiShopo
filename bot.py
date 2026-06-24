@@ -146,11 +146,14 @@ def init_db():
                 id SERIAL PRIMARY KEY,
                 product_id TEXT,
                 content TEXT,
+                kind TEXT DEFAULT 'text',
                 used BOOLEAN DEFAULT FALSE,
                 used_by BIGINT,
                 used_at TEXT
             )
         """)
+        # 'text' = plain text/code/link, 'photo' = Telegram file_id of a QR image
+        c.execute("ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS kind TEXT DEFAULT 'text'")
         c.execute("CREATE INDEX IF NOT EXISTS idx_stock_items_pid ON stock_items (product_id, used)")
         c.execute("""
             CREATE TABLE IF NOT EXISTS translations (
@@ -354,25 +357,28 @@ def sync_auto_stock(pid: str):
         c.execute("UPDATE products SET stock=%s WHERE id=%s", (n, pid))
     return n
 
-def add_stock_items(pid: str, items: list):
+def add_stock_items(pid: str, items: list, kind: str = "text"):
+    """Add stock items. `items` is a list of strings (text/codes) or Telegram
+    file_ids (when kind='photo')."""
     with db_cursor(commit=True) as c:
         for content in items:
-            c.execute("INSERT INTO stock_items (product_id, content, used) VALUES (%s,%s,FALSE)",
-                      (pid, content))
+            c.execute("INSERT INTO stock_items (product_id, content, kind, used) VALUES (%s,%s,%s,FALSE)",
+                      (pid, content, kind))
     return sync_auto_stock(pid)
 
 def pop_stock_items(pid: str, qty: int):
-    """Atomically claim up to `qty` unused items. Returns list of contents delivered."""
+    """Atomically claim up to `qty` unused items.
+    Returns list of dicts: {"kind": "text"|"photo", "content": str}."""
     delivered = []
     with db_cursor(commit=True) as c:
-        c.execute("""SELECT id, content FROM stock_items
+        c.execute("""SELECT id, content, kind FROM stock_items
                      WHERE product_id=%s AND used=FALSE
                      ORDER BY id ASC LIMIT %s FOR UPDATE""", (pid, qty))
         rows = c.fetchall()
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         for r in rows:
             c.execute("UPDATE stock_items SET used=TRUE, used_at=%s WHERE id=%s", (now, r["id"]))
-            delivered.append(r["content"])
+            delivered.append({"kind": r["kind"] or "text", "content": r["content"]})
     sync_auto_stock(pid)
     return delivered
 
@@ -1151,8 +1157,12 @@ async def deliver_product(uid: int, p: dict, qty: int, order_code: str, total: f
     if p.get("delivery_type") == "auto":
         items = pop_stock_items(pid, qty)
         if items:
-            body = "\n".join(f"<code>{html.escape(it)}</code>" for it in items)
-            text = f"{header}\n\n🎁 <b>{t(uid, 'your_items')}</b>\n{body}"
+            text_items = [it["content"] for it in items if it["kind"] == "text"]
+            photo_items = [it["content"] for it in items if it["kind"] == "photo"]
+            # Header message, listing any text items inline
+            text = f"{header}\n\n🎁 <b>{t(uid, 'your_items')}</b>"
+            if text_items:
+                text += "\n" + "\n".join(f"<code>{html.escape(c)}</code>" for c in text_items)
             if len(items) < qty:
                 # Not enough stock — deliver what we have, escalate the rest
                 missing = qty - len(items)
@@ -1160,7 +1170,19 @@ async def deliver_product(uid: int, p: dict, qty: int, order_code: str, total: f
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")]
             ])
-            await bot.send_message(uid, text, parse_mode="HTML", reply_markup=kb)
+            await bot.send_message(uid, text, parse_mode="HTML",
+                                   reply_markup=None if photo_items else kb)
+            # Deliver each QR image as a photo
+            for idx, file_id in enumerate(photo_items):
+                is_last = idx == len(photo_items) - 1
+                try:
+                    await bot.send_photo(
+                        uid, file_id,
+                        caption=f"📷 {t(uid, 'your_items')} ({idx + 1}/{len(photo_items)})",
+                        reply_markup=kb if is_last else None
+                    )
+                except Exception as e:
+                    print(f"[deliver] send_photo failed: {e}")
             return
         # No items available at all -> fall through to manual escalation
         text = f"{header}\n\n⏳ {t(uid, 'await_manual', admin=ADMIN)}"
