@@ -164,6 +164,21 @@ def init_db():
             )
         """)
         c.execute("""
+            CREATE TABLE IF NOT EXISTS pix_scans (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                kind TEXT DEFAULT 'code',
+                content TEXT,
+                amount DOUBLE PRECISION DEFAULT 0,
+                pix_value DOUBLE PRECISION,
+                info TEXT DEFAULT '',
+                status TEXT DEFAULT 'pending',
+                created_at TEXT,
+                expires_at TEXT
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_pix_scans_status ON pix_scans (status)")
+        c.execute("""
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -447,6 +462,140 @@ async def translate_text(text: str, target_lang: str) -> str:
         print(f"[translate] failed ({target_lang}): {e}")
         return text
 
+# ================== PIX SCAN (read & pay) ==================
+# Default config (stored in app_settings, editable by admin)
+def pix_scan_price() -> float:
+    try:
+        return float(get_setting("pix_scan_price", "0.5"))
+    except ValueError:
+        return 0.5
+
+def pix_scan_timeout_min() -> int:
+    try:
+        return int(get_setting("pix_scan_timeout_min", "10"))
+    except ValueError:
+        return 10
+
+def pix_scan_enabled() -> bool:
+    return get_setting("pix_scan_enabled", "1") == "1"
+
+def _emv_parse(code: str) -> dict:
+    """Parse an EMV BR Code (PIX copia-e-cola) TLV string into {tag: value}."""
+    result = {}
+    i = 0
+    n = len(code)
+    while i + 4 <= n:
+        tag = code[i:i + 2]
+        try:
+            length = int(code[i + 2:i + 4])
+        except ValueError:
+            break
+        i += 4
+        value = code[i:i + length]
+        i += length
+        result[tag] = value
+    return result
+
+def looks_like_pix_code(text: str) -> bool:
+    """Heuristic: is this string a PIX copia-e-cola (EMV BR Code)?"""
+    if not text:
+        return False
+    t = text.strip().replace("\n", "").replace(" ", "")
+    if len(t) < 30:
+        return False
+    if not t.startswith("000201") and not t.startswith("00020101"):
+        return False
+    return ("br.gov.bcb.pix" in t.lower()) or ("BR.GOV.BCB.PIX" in t)
+
+def summarize_pix(code: str):
+    """Return (info_text, pix_value or None) parsed from an EMV PIX code.
+    Only trims wrapping whitespace — internal spaces are part of TLV values
+    (e.g. merchant name/city) and must be preserved for correct lengths."""
+    code = code.strip()
+    fields = _emv_parse(code)
+    value = None
+    raw_value = fields.get("54")
+    if raw_value:
+        try:
+            value = round(float(raw_value), 2)
+        except ValueError:
+            value = None
+    name = fields.get("59", "").strip()
+    city = fields.get("60", "").strip()
+    # Pix key lives inside the merchant account info (tag 26), subfield 01
+    key = ""
+    mai = fields.get("26", "")
+    if mai:
+        sub = _emv_parse(mai)
+        key = (sub.get("01") or "").strip()
+    parts = []
+    if name:
+        parts.append(f"👤 Recebedor: <b>{html.escape(name)}</b>")
+    if key:
+        parts.append(f"🔑 Chave: <code>{html.escape(key)}</code>")
+    if city:
+        parts.append(f"🏙 Cidade: {html.escape(city)}")
+    if value is not None:
+        parts.append(f"💵 Valor do PIX: <b>R$ {value:.2f}</b>")
+    else:
+        parts.append("💵 Valor do PIX: <i>livre (sem valor fixo)</i>")
+    info = "\n".join(parts) if parts else "Dados do PIX não identificados."
+    return info, value
+
+def decode_qr_from_bytes(img_bytes: bytes):
+    """Decode a QR code image (bytes) into its text payload. Returns str or None."""
+    try:
+        import cv2
+        import numpy as np
+        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        detector = cv2.QRCodeDetector()
+        data, points, _ = detector.detectAndDecode(img)
+        if data:
+            return data
+        # Retry on an upscaled grayscale version for low-res photos
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        data, points, _ = detector.detectAndDecode(gray)
+        return data or None
+    except Exception as e:
+        print(f"[pix] QR decode failed: {e}")
+        return None
+
+def create_pix_scan(user_id: int, kind: str, content: str, amount: float,
+                    pix_value, info: str, timeout_min: int) -> int:
+    now = datetime.now()
+    expires = now + timedelta(minutes=timeout_min)
+    with db_cursor(commit=True) as c:
+        c.execute("""INSERT INTO pix_scans
+                     (user_id, kind, content, amount, pix_value, info, status, created_at, expires_at)
+                     VALUES (%s,%s,%s,%s,%s,%s,'pending',%s,%s) RETURNING id""",
+                  (user_id, kind, content, amount, pix_value, info,
+                   now.strftime("%Y-%m-%d %H:%M:%S"), expires.strftime("%Y-%m-%d %H:%M:%S")))
+        return c.fetchone()["id"]
+
+def get_pix_scan(scan_id: int):
+    with db_cursor() as c:
+        c.execute("SELECT * FROM pix_scans WHERE id=%s", (scan_id,))
+        row = c.fetchone()
+    return dict(row) if row else None
+
+def set_pix_scan_status(scan_id: int, status: str) -> bool:
+    """Atomically move a pending scan to a new status. Returns True if it was pending."""
+    with db_cursor(commit=True) as c:
+        c.execute("UPDATE pix_scans SET status=%s WHERE id=%s AND status='pending'",
+                  (status, scan_id))
+        return c.rowcount > 0
+
+def get_expired_pending_scans():
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_cursor() as c:
+        c.execute("SELECT * FROM pix_scans WHERE status='pending' AND expires_at < %s", (now,))
+        rows = c.fetchall()
+    return [dict(r) for r in rows]
+
 # ----- Admin helpers -----
 def get_all_user_ids():
     with db_cursor() as c:
@@ -558,6 +707,28 @@ LANGS = {
         "contact_seller": "💬 Contact seller",
         "manual_instructions": "To receive your product, contact the seller {admin} and send the message below:",
         "copy_message": "Copy and send this message:",
+        "btn_pix_scan": "📷 Read PIX",
+        "pix_scan_intro": (
+            "📷 <b>Read PIX</b>\n\n"
+            "Send the <b>QR code image</b> or the <b>PIX copy-and-paste code</b> and we will process it for you.\n\n"
+            "💵 Price per scan: <b>${price:.2f} USDT</b>\n"
+            "⏳ Processing time: up to <b>{minutes} min</b> (if not done in time, you are fully refunded)."
+        ),
+        "pix_scan_send": "Send the QR image or the PIX code now:",
+        "pix_not_recognized": "❌ Couldn't read a valid PIX there. Send a clear QR image or the copy-and-paste code.",
+        "pix_insufficient": "❌ Insufficient balance. Each scan costs ${price:.2f}. Your balance: ${balance:.2f}. Please deposit first.",
+        "pix_pending": (
+            "✅ <b>PIX received!</b>\n\n{info}\n\n"
+            "💵 Charged: <b>${price:.2f} USDT</b>\n"
+            "⏳ Status: <b>processing</b> (up to {minutes} min)\n\n"
+            "You'll be notified as soon as it's read. If it isn't done in time, you'll be refunded automatically."
+        ),
+        "pix_confirmed": "✅ <b>PIX read successfully!</b>\n\nScan #{sid} is done. Thank you!",
+        "pix_refunded": (
+            "↩️ <b>Refund issued</b>\n\nScan #{sid} wasn't processed in time, so ${price:.2f} was returned to your balance."
+        ),
+        "pix_disabled": "📷 The Read PIX service is currently unavailable. Try again later.",
+        "pix_cancel": "❌ Cancel",
     },
     "pt": {
         "welcome": (
@@ -640,6 +811,28 @@ LANGS = {
         "contact_seller": "💬 Falar com o vendedor",
         "manual_instructions": "Para receber seu produto, fale com o vendedor {admin} e envie a mensagem abaixo:",
         "copy_message": "Copie e envie esta mensagem:",
+        "btn_pix_scan": "📷 Ler PIX",
+        "pix_scan_intro": (
+            "📷 <b>Ler PIX</b>\n\n"
+            "Envie a <b>imagem do QR code</b> ou o <b>código PIX copia e cola</b> que a gente processa pra você.\n\n"
+            "💵 Preço por leitura: <b>${price:.2f} USDT</b>\n"
+            "⏳ Tempo de processamento: até <b>{minutes} min</b> (se não for feito no prazo, você é reembolsado integralmente)."
+        ),
+        "pix_scan_send": "Envie a imagem do QR ou o código PIX agora:",
+        "pix_not_recognized": "❌ Não consegui ler um PIX válido aí. Envie uma imagem nítida do QR ou o código copia e cola.",
+        "pix_insufficient": "❌ Saldo insuficiente. Cada leitura custa ${price:.2f}. Seu saldo: ${balance:.2f}. Faça um depósito primeiro.",
+        "pix_pending": (
+            "✅ <b>PIX recebido!</b>\n\n{info}\n\n"
+            "💵 Cobrado: <b>${price:.2f} USDT</b>\n"
+            "⏳ Status: <b>em processamento</b> (até {minutes} min)\n\n"
+            "Você será avisado assim que for lido. Se não der tempo, o valor volta automaticamente pro seu saldo."
+        ),
+        "pix_confirmed": "✅ <b>PIX lido com sucesso!</b>\n\nA leitura #{sid} foi concluída. Obrigado!",
+        "pix_refunded": (
+            "↩️ <b>Reembolso realizado</b>\n\nA leitura #{sid} não foi processada a tempo, então ${price:.2f} voltou pro seu saldo."
+        ),
+        "pix_disabled": "📷 O serviço de Ler PIX está indisponível no momento. Tente mais tarde.",
+        "pix_cancel": "❌ Cancelar",
     },
     "id": {
         "welcome": (
@@ -656,7 +849,7 @@ LANGS = {
         "shop_title": "🛒 <b>TOKO</b>\n\nPilih produk:",
         "in_stock": "Tersedia",
         "out_of_stock": "Habis",
-        "back": "⬅️ Kembali",
+        "back": "���️ Kembali",
         "back_to_shop": "⬅️ Kembali ke Toko",
         "back_to_wallet": "⬅️ Kembali ke Dompet",
         "buy_now": "💳 Beli Sekarang",
@@ -1081,6 +1274,8 @@ SEED_PRODUCTS = [
 awaiting_qty = {}
 # Tracks admin multi-step flows: {user_id: {"action": str, "step": str, "data": {...}}}
 admin_state = {}
+# Tracks users in "send me your PIX" mode: set of user_ids
+awaiting_pix = set()
 
 # ================== HELPERS ==================
 def t(user_id: int, key: str, **kwargs) -> str:
@@ -1093,6 +1288,10 @@ def t(user_id: int, key: str, **kwargs) -> str:
 def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=t(user_id, "btn_shop"), callback_data="shop")],
+    ]
+    if pix_scan_enabled():
+        rows.append([InlineKeyboardButton(text=t(user_id, "btn_pix_scan"), callback_data="pix_scan")])
+    rows += [
         [
             InlineKeyboardButton(text=t(user_id, "btn_profile"), callback_data="profile"),
             InlineKeyboardButton(text=t(user_id, "btn_history"), callback_data="history"),
@@ -1219,7 +1418,7 @@ def build_payment_message(uid: int, amount: float, code: str, bep20_amount: floa
         lines.append(t(uid, "waiting_payment"))
 
     lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("━━━━━━━━━━━━━━━━��━━━")
     lines.append(f"🔶 <b>{t(uid, 'option1_title')}</b>")
     lines.append("")
     lines.append(f"🆔 {t(uid, 'option1_binance_id')}:")
@@ -1363,12 +1562,144 @@ async def buy_product(callback: types.CallbackQuery):
         ])
     )
 
+# ================== PIX SCAN — CLIENT FLOW ==================
+@dp.callback_query(F.data == "pix_scan")
+async def pix_scan_start(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    get_user(uid)
+    if not pix_scan_enabled():
+        await callback.answer(t(uid, "pix_disabled"), show_alert=True)
+        return
+    awaiting_pix.add(uid)
+    price = pix_scan_price()
+    minutes = pix_scan_timeout_min()
+    await callback.message.edit_text(
+        t(uid, "pix_scan_intro", price=price, minutes=minutes),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=t(uid, "pix_cancel"), callback_data="pix_cancel")],
+        ])
+    )
+
+@dp.callback_query(F.data == "pix_cancel")
+async def pix_scan_cancel(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    awaiting_pix.discard(uid)
+    await callback.message.edit_text(
+        t(uid, "choose_option"),
+        reply_markup=main_menu_kb(uid),
+        parse_mode="HTML"
+    )
+
+async def notify_admins_pix(scan_id: int, code_text: str):
+    scan = get_pix_scan(scan_id)
+    if not scan:
+        return
+    uid = scan["user_id"]
+    uname = ""
+    try:
+        chat = await bot.get_chat(uid)
+        if chat.username:
+            uname = f" (@{chat.username})"
+    except Exception:
+        pass
+    caption = (
+        f"📷 <b>Nova leitura de PIX #{scan_id}</b>\n\n"
+        f"👤 Cliente: <code>{uid}</code>{html.escape(uname)}\n"
+        f"{scan['info']}\n\n"
+        f"⏳ Expira às {scan['expires_at'][11:16]} (se não confirmar, o cliente é reembolsado)"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ PIX lido", callback_data=f"pixok_{scan_id}")],
+        [InlineKeyboardButton(text="↩️ Reembolsar", callback_data=f"pixno_{scan_id}")],
+    ])
+    for aid in ADMIN_IDS:
+        try:
+            if scan["kind"] == "photo":
+                await bot.send_photo(aid, scan["content"], caption=caption, parse_mode="HTML", reply_markup=kb)
+                if code_text:
+                    await bot.send_message(aid, f"📋 Copia e cola:\n<code>{html.escape(code_text)}</code>",
+                                           parse_mode="HTML")
+            else:
+                await bot.send_message(
+                    aid,
+                    f"{caption}\n\n📋 Copia e cola:\n<code>{html.escape(scan['content'])}</code>",
+                    parse_mode="HTML", reply_markup=kb
+                )
+        except Exception as e:
+            print(f"[pix] notify admin {aid} failed: {e}")
+
+async def process_pix_submission(message: types.Message, kind: str, file_id, code_text: str):
+    uid = message.from_user.id
+    if not pix_scan_enabled():
+        await message.answer(t(uid, "pix_disabled"))
+        awaiting_pix.discard(uid)
+        return
+    if not code_text or not looks_like_pix_code(code_text):
+        await message.reply(t(uid, "pix_not_recognized"))
+        return
+
+    price = pix_scan_price()
+    user = get_user(uid)
+    if user["balance"] < price:
+        awaiting_pix.discard(uid)
+        await message.answer(
+            t(uid, "pix_insufficient", price=price, balance=user["balance"]),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=t(uid, "btn_wallet"), callback_data="wallet")],
+                [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")],
+            ])
+        )
+        return
+
+    # Charge and create the pending scan
+    update_balance(uid, -price)
+    info, pix_value = summarize_pix(code_text)
+    content = file_id if kind == "photo" else code_text
+    minutes = pix_scan_timeout_min()
+    scan_id = create_pix_scan(uid, kind, content, price, pix_value, info, minutes)
+    awaiting_pix.discard(uid)
+
+    await message.answer(
+        t(uid, "pix_pending", info=info, price=price, minutes=minutes),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=t(uid, "back"), callback_data="main_menu")],
+        ])
+    )
+    await notify_admins_pix(scan_id, code_text)
+
+@dp.message(F.photo)
+async def handle_photo(message: types.Message):
+    uid = message.from_user.id
+    if uid not in awaiting_pix:
+        return
+    # Largest photo size is the last in the list
+    file_id = message.photo[-1].file_id
+    try:
+        tg_file = await bot.get_file(file_id)
+        buf = await bot.download_file(tg_file.file_path)
+        img_bytes = buf.read()
+    except Exception as e:
+        print(f"[pix] download failed: {e}")
+        await message.reply(t(uid, "pix_not_recognized"))
+        return
+    code_text = decode_qr_from_bytes(img_bytes)
+    await process_pix_submission(message, "photo", file_id, code_text)
+
+
 @dp.message(F.text)
 async def handle_text(message: types.Message):
     uid = message.from_user.id
 
     # Admin multi-step flows take priority
     if await handle_admin_text(message):
+        return
+
+    # PIX scan: user is in scan mode, or pasted a PIX copy-and-paste code
+    if uid in awaiting_pix or looks_like_pix_code(message.text):
+        await process_pix_submission(message, "code", None, message.text.strip())
         return
 
     if uid not in awaiting_qty:
@@ -1618,11 +1949,87 @@ async def change_lang(callback: types.CallbackQuery):
 def admin_main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Produtos", callback_data="admin_products")],
+        [InlineKeyboardButton(text="📷 Config Ler PIX", callback_data="admin_pix")],
         [InlineKeyboardButton(text="📢 Aviso para todos", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="💰 Ajustar saldo", callback_data="admin_balance")],
         [InlineKeyboardButton(text="📊 Estatísticas", callback_data="admin_stats")],
         [InlineKeyboardButton(text="⬅️ Voltar ao menu", callback_data="main_menu")],
     ])
+
+def admin_pix_kb() -> InlineKeyboardMarkup:
+    enabled = pix_scan_enabled()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🟢 Serviço LIGADO ▸ desligar" if enabled else "🔴 Serviço DESLIGADO ▸ ligar",
+            callback_data="admin_pix_toggle"
+        )],
+        [InlineKeyboardButton(text="💵 Mudar preço por leitura", callback_data="admin_pix_price")],
+        [InlineKeyboardButton(text="⏳ Mudar tempo limite", callback_data="admin_pix_timeout")],
+        [InlineKeyboardButton(text="⬅️ Voltar", callback_data="admin")],
+    ])
+
+async def render_admin_pix(target, edit: bool):
+    text = (
+        "📷 <b>CONFIG — LER PIX</b>\n\n"
+        f"Estado: <b>{'🟢 Ligado' if pix_scan_enabled() else '🔴 Desligado'}</b>\n"
+        f"💵 Preço por leitura: <b>${pix_scan_price():.2f} USDT</b>\n"
+        f"⏳ Tempo limite: <b>{pix_scan_timeout_min()} min</b>\n\n"
+        "Quando ligado, aparece o botão “📷 Ler PIX” no menu dos clientes. "
+        "Eles enviam o QR/código, são cobrados, e você recebe aqui pra ler. "
+        "Se você não confirmar no tempo limite, o cliente é reembolsado automaticamente."
+    )
+    if edit:
+        await target.message.edit_text(text, reply_markup=admin_pix_kb(), parse_mode="HTML")
+    else:
+        await target.answer(text, reply_markup=admin_pix_kb(), parse_mode="HTML")
+
+@dp.callback_query(F.data == "admin_pix")
+async def admin_pix(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    admin_state.pop(uid, None)
+    await render_admin_pix(callback, edit=True)
+
+@dp.callback_query(F.data == "admin_pix_toggle")
+async def admin_pix_toggle(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    set_setting("pix_scan_enabled", "0" if pix_scan_enabled() else "1")
+    await render_admin_pix(callback, edit=True)
+
+@dp.callback_query(F.data == "admin_pix_price")
+async def admin_pix_price(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    admin_state[uid] = {"action": "pix_price"}
+    await callback.message.edit_text(
+        "💵 Envie o novo <b>preço por leitura</b> em USDT (ex: <code>0.5</code>):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancelar", callback_data="admin_pix")]
+        ])
+    )
+
+@dp.callback_query(F.data == "admin_pix_timeout")
+async def admin_pix_timeout(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    admin_state[uid] = {"action": "pix_timeout"}
+    await callback.message.edit_text(
+        "⏳ Envie o novo <b>tempo limite</b> em minutos (ex: <code>10</code>):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancelar", callback_data="admin_pix")]
+        ])
+    )
 
 ADMIN_HOME_TEXT = (
     "🛠 <b>PAINEL ADMIN</b>\n\n"
@@ -2028,6 +2435,35 @@ async def handle_admin_text(message: types.Message) -> bool:
     action = st.get("action")
     txt = message.text.strip()
 
+    # ----- PIX scan settings -----
+    if action == "pix_price":
+        try:
+            value = round(float(txt.replace(",", ".")), 2)
+            if value < 0:
+                raise ValueError
+        except ValueError:
+            await message.reply("Valor inválido. Envie um número, ex: 0.5")
+            return True
+        set_setting("pix_scan_price", str(value))
+        admin_state.pop(uid, None)
+        await message.answer(f"✅ Preço por leitura definido em ${value:.2f} USDT.")
+        await render_admin_pix(message, edit=False)
+        return True
+
+    if action == "pix_timeout":
+        try:
+            value = int(txt)
+            if value < 1:
+                raise ValueError
+        except ValueError:
+            await message.reply("Valor inválido. Envie um número inteiro de minutos, ex: 10")
+            return True
+        set_setting("pix_scan_timeout_min", str(value))
+        admin_state.pop(uid, None)
+        await message.answer(f"✅ Tempo limite definido em {value} min.")
+        await render_admin_pix(message, edit=False)
+        return True
+
     # ----- Edit single product field -----
     if action == "edit_field":
         field, pid = st["field"], st["pid"]
@@ -2379,6 +2815,96 @@ async def check_binance_pay():
             continue
 
 
+# ================== PIX SCAN — ADMIN CONFIRM / REFUND / EXPIRY ==================
+@dp.callback_query(F.data.startswith("pixok_"))
+async def pix_admin_confirm(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    scan_id = int(callback.data[len("pixok_"):])
+    scan = get_pix_scan(scan_id)
+    if not scan:
+        await callback.answer("Leitura não encontrada.", show_alert=True)
+        return
+    if scan["status"] != "pending":
+        await callback.answer(f"Já processada ({scan['status']}).", show_alert=True)
+        return
+    if not set_pix_scan_status(scan_id, "done"):
+        await callback.answer("Já processada.", show_alert=True)
+        return
+    client = scan["user_id"]
+    try:
+        await bot.send_message(client, t(client, "pix_confirmed", sid=scan_id), parse_mode="HTML")
+    except Exception as e:
+        print(f"[pix] notify client done failed: {e}")
+    await callback.answer("✅ Marcado como lido.")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+@dp.callback_query(F.data.startswith("pixno_"))
+async def pix_admin_refund(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Acesso negado.", show_alert=True)
+        return
+    scan_id = int(callback.data[len("pixno_"):])
+    scan = get_pix_scan(scan_id)
+    if not scan:
+        await callback.answer("Leitura não encontrada.", show_alert=True)
+        return
+    if scan["status"] != "pending":
+        await callback.answer(f"Já processada ({scan['status']}).", show_alert=True)
+        return
+    if not set_pix_scan_status(scan_id, "refunded"):
+        await callback.answer("Já processada.", show_alert=True)
+        return
+    client = scan["user_id"]
+    update_balance(client, scan["amount"])  # give the money back as balance
+    try:
+        await bot.send_message(client, t(client, "pix_refunded", sid=scan_id, price=scan["amount"]),
+                               parse_mode="HTML")
+    except Exception as e:
+        print(f"[pix] notify client refund failed: {e}")
+    await callback.answer("↩️ Reembolsado.")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+async def pix_expiry_loop():
+    """Refund PIX scans that weren't processed before their deadline."""
+    print("[pix] expiry watcher started.")
+    while True:
+        try:
+            for scan in get_expired_pending_scans():
+                if set_pix_scan_status(scan["id"], "refunded"):
+                    client = scan["user_id"]
+                    update_balance(client, scan["amount"])
+                    try:
+                        await bot.send_message(
+                            client,
+                            t(client, "pix_refunded", sid=scan["id"], price=scan["amount"]),
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        print(f"[pix] expiry notify failed: {e}")
+                    # Let admins know it expired
+                    for aid in ADMIN_IDS:
+                        try:
+                            await bot.send_message(
+                                aid, f"⌛ Leitura PIX #{scan['id']} expirou e foi reembolsada ao cliente "
+                                     f"<code>{client}</code>.", parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"[pix] expiry loop error: {e}")
+        await asyncio.sleep(30)
+
+
 async def scanner_loop():
     if not BSCSCAN_API_KEY and not (BINANCE_API_KEY and BINANCE_API_SECRET):
         print("[scanner] No payment APIs configured — auto-detection disabled.")
@@ -2411,6 +2937,7 @@ async def main():
     except Exception as e:
         print(f"[startup] delete_webhook warning: {e}")
     asyncio.create_task(scanner_loop())
+    asyncio.create_task(pix_expiry_loop())
     # NOTE: If you ever see a permanent "TelegramConflictError ... terminated by
     # other getUpdates request" loop, it means ANOTHER instance is polling this
     # same token somewhere. The only guaranteed fix is to /revoke the token in
